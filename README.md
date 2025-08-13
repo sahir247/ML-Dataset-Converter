@@ -1,4 +1,3 @@
-# ML-Dataset-Converter
 # Raw CSV → Training Dataset Converter (Tkinter)
 
 A simple desktop app to convert a raw CSV into user-selected training dataset formats with optional train/val/test splits and stratification.
@@ -46,6 +45,37 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 ```powershell
 python app.py
 ```
+
+### Fresh machine quickstart (Windows)
+
+You can either run the portable EXE or run from source.
+
+- Run the EXE (no install):
+  - Build or download `dist/DatasetConverter/DatasetConverter.exe`
+  - Double-click to launch. If SmartScreen warns: click “More info” → “Run anyway”.
+
+- Run from source:
+  ```powershell
+  # 1) Install Python 3.10 or 3.11 (64-bit)
+
+  # 2) Create a virtual environment
+  py -m venv .venv
+  .\.venv\Scripts\activate
+  python -m pip install --upgrade pip
+
+  # 3) Install all dependencies
+  pip install -r requirements.txt
+  # Optional: on CPU-only machines, smaller wheels via PyTorch CPU index
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+  # 4) Run the app
+  python app.py
+  ```
+
+Notes:
+- Model weights (Ultralytics/TorchVision) download on first use. If offline, use the app’s `Download Models` button later when online, or place the `.pt` files next to the EXE or in your working directory.
+- TensorFlow is only required for TFRecord export; if it fails to install on your Python/Windows version, remove it from `requirements.txt` and other features will still work.
+- Some systems may prompt for Visual C++ runtime; follow the prompt once if needed.
 
 ## Supported output formats
 - __Tabular__: CSV, JSONL, Parquet, Feather, Excel (XLSX), SQLite
@@ -122,6 +152,15 @@ py -m venv .venv
 
 If Windows SmartScreen warns when running the EXE, click "More info" → "Run anyway" (you may sign the binary if distributing).
 
+### Distribute the EXE
+- Zip the entire folder `dist/DatasetConverter/` into `DatasetConverter-win.zip`.
+- Upload the zip to a GitHub Release.
+- In release notes, mention first-run notes (SmartScreen, model downloads/offline button).
+- Optional: publish a SHA256 checksum:
+  ```powershell
+  certutil -hashfile DatasetConverter-win.zip SHA256
+  ```
+
 ## Neural processing mode
 Neural mode auto-annotates your data using Ultralytics YOLO or TorchVision (classification-only).
 
@@ -148,4 +187,3 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 - Use the `Download Models` button to prefetch: `yolo11n.pt`, `yolov8n.pt`, `yolov8n-cls.pt`, `resnet18`, `resnet50`, `mobilenet_v3_small`, `efficientnet_b0`.
 - The downloader runs PowerShell and shows logs with a green progress bar and percentage.
 - If you attempt inference without network and weights are missing, the app will prompt you to download common models.
-
