@@ -1,0 +1,22 @@
+## All-in-one requirements (core + all optional features)
+
+# Core
+pandas>=2.2.3
+pyarrow>=14.0.0
+Pillow>=10.0.0
+
+# Excel export
+openpyxl>=3.1.0
+
+# Neural engines
+ultralytics>=8.0.0       # YOLO Detection/Classification
+
+# TorchVision Classification backend
+# Tip: On CPU-only machines, you may prefer installing these from the PyTorch CPU index via CLI:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+torchaudio
+
+# TFRecord export
+tensorflow>=2.12.0
