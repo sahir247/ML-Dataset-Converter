@@ -77,7 +77,7 @@ py -m venv .venv
 python -m pip install --upgrade pip
 
 # 3) Install all dependencies (all-in-one)
-pip install -r requirements2.txt
+pip install -r requirements.txt
 # Optional: on CPU-only machines, smaller wheels via PyTorch CPU index
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
