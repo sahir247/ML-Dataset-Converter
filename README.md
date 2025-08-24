@@ -185,17 +185,6 @@ py -m venv .venv
 
 If Windows SmartScreen warns when running the EXE, click "More info" → "Run anyway" (you may sign the binary if distributing).
 
-### Distribute the EXE
-
-- Zip the entire folder `dist/DatasetConverter/` into `DatasetConverter-win.zip`.
-- Upload the zip to a GitHub Release.
-- In release notes, mention first-run notes (SmartScreen, model downloads/offline button).
-- Optional: publish a SHA256 checksum:
-
-```powershell
-certutil -hashfile DatasetConverter-win.zip SHA256
-```
-
 ## Neural processing mode
 
 Neural mode auto-annotates your data using Ultralytics YOLO or TorchVision (classification-only).
