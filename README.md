@@ -88,7 +88,7 @@ python app.py
 Notes:
 
 - Model weights (Ultralytics/TorchVision) download on first use. If offline, use the app’s `Download Models` button later when online, or place the `.pt` files next to the EXE or in your working directory.
-- TensorFlow is only required for TFRecord export; if it fails to install on your Python/Windows version, remove it from `requirements2.txt` and other features will still work.
+- TensorFlow is only required for TFRecord export; if it fails to install on your Python/Windows version, remove it from `requirements.txt` and other features will still work.
 - Some systems may prompt for Visual C++ runtime; follow the prompt once if needed.
 
 ### PATH warnings (Windows)
@@ -171,7 +171,7 @@ The EXE will be at `dist/DatasetConverter/DatasetConverter.exe`.
 # Create venv if needed
 py -m venv .venv
 .\.venv\Scripts\python -m pip install --upgrade pip
-.\.venv\Scripts\python -m pip install -r requirements2.txt
+.\.venv\Scripts\python -m pip install -r requirements.txt
 .\.venv\Scripts\python -m pip install pyinstaller
 
 # Build
