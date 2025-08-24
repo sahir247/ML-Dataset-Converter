@@ -12,6 +12,12 @@ import tarfile
 from pathlib import Path
 from tkinter import simpledialog
 import io
+import subprocess
+import tempfile
+import re
+import webbrowser
+# ML Training Page is imported lazily inside open_ml_training_page() to avoid
+# import-time dependency errors if optional ML packages are not installed yet.
 
 APP_NAME = "Dataset Converter"
 APP_VERSION = "1.0.0"
@@ -36,6 +42,31 @@ class DataProcessorApp(tk.Tk):
         self.geometry("860x620")
         self.minsize(820, 600)
 
+        # Preprocessing defaults (backend; UI can bind to these)
+        try:
+            self.do_preprocess_var = tk.BooleanVar(value=False)
+            self.missing_strategy_var = tk.StringVar(value="None")  # None | Drop rows | Fill numeric mean | Fill numeric median | Fill with 0/'' | FFill | BFill
+            self.scaling_var = tk.StringVar(value="None")            # None | Standardize (Z-score) | Min-Max [0,1]
+            self.encoding_var = tk.StringVar(value="None")           # None | One-Hot | Label/Ordinal
+            # Common paths/IDs not to touch by default
+            self.preproc_exclude_cols_var = tk.StringVar(value="image_path,audio_path,file_path,label")
+            # Advanced controls
+            self.preproc_include_num_cols_var = tk.StringVar(value="")
+            self.preproc_include_cat_cols_var = tk.StringVar(value="")
+            self.onehot_include_nan_var = tk.BooleanVar(value=False)
+            self.drop_nonfinite_after_scale_var = tk.BooleanVar(value=False)
+        except Exception:
+            # If Tk variables cannot be created for some reason, fall back to plain attributes
+            self.do_preprocess_var = type("_", (), {"get": lambda *_: False})()
+            self.missing_strategy_var = type("_", (), {"get": lambda *_: "None"})()
+            self.scaling_var = type("_", (), {"get": lambda *_: "None"})()
+            self.encoding_var = type("_", (), {"get": lambda *_: "None"})()
+            self.preproc_exclude_cols_var = type("_", (), {"get": lambda *_: "image_path,audio_path,file_path,label"})()
+            self.preproc_include_num_cols_var = type("_", (), {"get": lambda *_: ""})()
+            self.preproc_include_cat_cols_var = type("_", (), {"get": lambda *_: ""})()
+            self.onehot_include_nan_var = type("_", (), {"get": lambda *_: False})()
+            self.drop_nonfinite_after_scale_var = type("_", (), {"get": lambda *_: False})()
+
         self._build_menu()
         self._build_ui()
         self._load_settings()
@@ -50,13 +81,252 @@ class DataProcessorApp(tk.Tk):
         file_menu.add_command(label="Exit", command=self.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
 
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Verify Environment", command=self.verify_environment)
+        tools_menu.add_command(label="Setup Environment", command=self.setup_environment_ui)
+        tools_menu.add_command(label="ML Training Page", command=self.open_ml_training_page)
+        tools_menu.add_command(label="Environment Checker", command=self.open_env_checker_page)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+
         help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Help", command=self._show_help)
         help_menu.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
 
     def _build_ui(self):
-        container = ttk.Frame(self, padding=12)
-        container.pack(fill=tk.BOTH, expand=True)
+        # Notebook with three tabs: main converter, ML training, and Environment
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        main_tab = ttk.Frame(self.notebook)
+        self.ml_tab = ttk.Frame(self.notebook)
+        self.env_tab = ttk.Frame(self.notebook)
+        self.notebook.add(main_tab, text="Converter")
+        self.notebook.add(self.ml_tab, text="ML Training")
+        self.notebook.add(self.env_tab, text="Environment")
+
+        # Lazy init flag for ML tab
+        self._ml_inited = False
+        # Lazy init flag for Environment tab
+        self._env_inited = False
+
+        def _init_ml_tab():
+            if self._ml_inited:
+                return
+            try:
+                # Create scrollable container in ML tab
+                ml_scroll_root = ttk.Frame(self.ml_tab)
+                ml_scroll_root.pack(fill=tk.BOTH, expand=True)
+                ml_canvas = tk.Canvas(ml_scroll_root, borderwidth=0, highlightthickness=0)
+                ml_vscroll = ttk.Scrollbar(ml_scroll_root, orient="vertical", command=ml_canvas.yview)
+                ml_canvas.configure(yscrollcommand=ml_vscroll.set)
+
+                ml_canvas.grid(row=0, column=0, sticky=tk.NSEW)
+                ml_vscroll.grid(row=0, column=1, sticky=tk.NS)
+                ml_scroll_root.grid_rowconfigure(0, weight=1)
+                ml_scroll_root.grid_columnconfigure(0, weight=1)
+
+                ml_inner = ttk.Frame(ml_canvas)
+                ml_window = ml_canvas.create_window((0, 0), window=ml_inner, anchor="nw")
+
+                # Instantiate MLTrainingPage inside scrollable area
+                try:
+                    default_dir = (self.output_dir_var.get() or "").strip()
+                except Exception:
+                    default_dir = ""
+                from ml_training_page.ui import MLTrainingPage  # lazy import
+                ml_page = MLTrainingPage(ml_inner, default_export_dir=default_dir or os.getcwd())
+                ml_page.pack(fill=tk.BOTH, expand=True)
+
+                def _on_ml_frame_configure(event=None):
+                    try:
+                        ml_canvas.configure(scrollregion=ml_canvas.bbox("all"))
+                    except Exception:
+                        pass
+                ml_inner.bind("<Configure>", _on_ml_frame_configure)
+
+                def _on_ml_canvas_configure(event):
+                    try:
+                        ml_canvas.itemconfigure(ml_window, width=event.width)
+                    except Exception:
+                        pass
+                ml_canvas.bind("<Configure>", _on_ml_canvas_configure)
+
+                def _on_ml_mousewheel(event):
+                    try:
+                        delta = int(event.delta / 120)
+                    except Exception:
+                        delta = 0
+                    if delta:
+                        ml_canvas.yview_scroll(-delta, "units")
+
+                def _on_shift_mousewheel(event):
+                    try:
+                        delta = int(event.delta / 120)
+                    except Exception:
+                        delta = 0
+                    if delta:
+                        ml_canvas.xview_scroll(-delta, "units")
+
+                # Bind/unbind mouse wheel only when pointer is over the canvas
+                def _bind_ml_wheel(event=None):
+                    try:
+                        ml_canvas.bind_all("<MouseWheel>", _on_ml_mousewheel)
+                        ml_canvas.bind_all("<Shift-MouseWheel>", _on_shift_mousewheel)
+                    except Exception:
+                        pass
+                def _unbind_ml_wheel(event=None):
+                    try:
+                        ml_canvas.unbind_all("<MouseWheel>")
+                        ml_canvas.unbind_all("<Shift-MouseWheel>")
+                    except Exception:
+                        pass
+                ml_canvas.bind("<Enter>", _bind_ml_wheel)
+                ml_canvas.bind("<Leave>", _unbind_ml_wheel)
+
+                self._ml_inited = True
+                self._ml_canvas = ml_canvas
+            except Exception as e:
+                try:
+                    self.log(f"Failed to initialize ML tab: {e}")
+                    messagebox.showerror("ML Training Page", f"Failed to initialize ML tab: {e}")
+                except Exception:
+                    pass
+
+        # Expose initializer for external callers
+        self._init_ml_tab = _init_ml_tab
+
+        def _init_env_tab():
+            if self._env_inited:
+                return
+            try:
+                container = ttk.Frame(self.env_tab, padding=12)
+                container.pack(fill=tk.BOTH, expand=True)
+
+                # Buttons row
+                btn_row = ttk.Frame(container)
+                btn_row.pack(fill=tk.X, pady=(0, 8))
+                ttk.Button(btn_row, text="Detect GPU", command=self.env_detect_gpu).pack(side=tk.LEFT)
+                ttk.Button(btn_row, text="Check Frameworks", command=self.env_check_frameworks).pack(side=tk.LEFT, padx=(6,0))
+                ttk.Button(btn_row, text="Install Frameworks", command=self.env_install_frameworks).pack(side=tk.LEFT, padx=(6,0))
+                ttk.Button(btn_row, text="Upgrade Frameworks (Linux)", command=self.env_upgrade_frameworks).pack(side=tk.LEFT, padx=(6,0))
+                ttk.Button(btn_row, text="Check CUDA/cuDNN", command=self.env_check_cuda_cudnn).pack(side=tk.LEFT, padx=(6,0))
+                ttk.Button(btn_row, text="Calibrate GPU", command=self.env_calibrate_gpu).pack(side=tk.LEFT, padx=(6,0))
+                ttk.Button(btn_row, text="Refresh Summary", command=self.env_refresh_summary).pack(side=tk.LEFT, padx=(6,0))
+
+                # Output log
+                out_frame = ttk.LabelFrame(container, text="Environment Checker Output", padding=8)
+                out_frame.pack(fill=tk.BOTH, expand=True)
+                of_body = ttk.Frame(out_frame)
+                of_body.pack(fill=tk.BOTH, expand=True)
+                self._env_out_text = tk.Text(of_body, height=10, wrap=tk.WORD, state=tk.DISABLED)
+                of_scroll = ttk.Scrollbar(of_body, orient="vertical", command=self._env_out_text.yview)
+                self._env_out_text.configure(yscrollcommand=of_scroll.set)
+                self._env_out_text.grid(row=0, column=0, sticky=tk.NSEW)
+                of_scroll.grid(row=0, column=1, sticky=tk.NS)
+                of_body.columnconfigure(0, weight=1)
+                of_body.rowconfigure(0, weight=1)
+
+                # Summary panel
+                sum_frame = ttk.LabelFrame(container, text="Final Status Summary", padding=8)
+                sum_frame.pack(fill=tk.BOTH, expand=False, pady=(8,0))
+                self._env_summary_text = tk.Text(sum_frame, height=8, wrap=tk.WORD, state=tk.DISABLED)
+                self._env_summary_text.pack(fill=tk.BOTH, expand=True)
+
+                # Status store
+                self._env_status = {}
+                self._env_inited = True
+            except Exception as e:
+                try:
+                    self.log(f"Failed to initialize Environment tab: {e}")
+                    messagebox.showerror("Environment Checker", f"Failed to initialize Environment tab: {e}")
+                except Exception:
+                    pass
+
+        # Expose initializer
+        self._init_env_tab = _init_env_tab
+
+        def _on_tab_changed(event=None):
+            try:
+                idx = self.notebook.index("current")
+                ml_idx = self.notebook.index(self.ml_tab)
+                env_idx = self.notebook.index(self.env_tab)
+                if idx == ml_idx:
+                    _init_ml_tab()
+                if idx == env_idx:
+                    _init_env_tab()
+            except Exception:
+                pass
+        self.notebook.bind("<<NotebookTabChanged>>", _on_tab_changed)
+
+        # Root scrollable area (Canvas + both scrollbars) for main tab
+        scroll_root = ttk.Frame(main_tab)
+        scroll_root.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(scroll_root, borderwidth=0, highlightthickness=0)
+        vscroll = ttk.Scrollbar(scroll_root, orient="vertical", command=canvas.yview)
+        hscroll = ttk.Scrollbar(scroll_root, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+
+        # Layout scroll components
+        canvas.grid(row=0, column=0, sticky=tk.NSEW)
+        vscroll.grid(row=0, column=1, sticky=tk.NS)
+        hscroll.grid(row=1, column=0, sticky=tk.EW)
+        scroll_root.columnconfigure(0, weight=1)
+        scroll_root.rowconfigure(0, weight=1)
+
+        # Content frame inside canvas
+        container = ttk.Frame(canvas, padding=12)
+        canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
+
+        # Update scrollregion when content changes size
+        def _on_frame_configure(event=None):
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+        container.bind("<Configure>", _on_frame_configure)
+
+        # Keep inner frame width in sync with canvas width (reduces unnecessary horizontal scroll)
+        def _on_canvas_configure(event):
+            try:
+                canvas.itemconfigure(canvas_window, width=event.width)
+            except Exception:
+                pass
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Optional: mouse wheel scrolling (Windows/macOS). Shift+Wheel for horizontal
+        def _on_mousewheel(event):
+            try:
+                delta = int(event.delta / 120)
+            except Exception:
+                delta = 0
+            if delta:
+                canvas.yview_scroll(-delta, "units")
+
+        def _on_shift_mousewheel(event):
+            try:
+                delta = int(event.delta / 120)
+            except Exception:
+                delta = 0
+            if delta:
+                canvas.xview_scroll(-delta, "units")
+
+        # Bind/unbind mouse wheel only when pointer is over the canvas
+        def _bind_wheel(event=None):
+            try:
+                canvas.bind_all("<MouseWheel>", _on_mousewheel)
+                canvas.bind_all("<Shift-MouseWheel>", _on_shift_mousewheel)
+            except Exception:
+                pass
+        def _unbind_wheel(event=None):
+            try:
+                canvas.unbind_all("<MouseWheel>")
+                canvas.unbind_all("<Shift-MouseWheel>")
+            except Exception:
+                pass
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
 
         # Input file
         in_frame = ttk.LabelFrame(container, text="Input Raw CSV", padding=10)
@@ -150,9 +420,13 @@ class DataProcessorApp(tk.Tk):
         self.preset_combo = ttk.Combobox(out_frame, textvariable=self.preset_model_var, state="readonly", width=22)
         self.preset_combo.grid(row=5, column=3, sticky=tk.W, padx=(4,0))
 
-        # Download models button (offline fetch)
-        self.download_btn = ttk.Button(out_frame, text="Download Models", command=self.download_models_ui)
-        self.download_btn.grid(row=5, column=4, sticky=tk.W, padx=(8,0))
+        # Download models button (offline fetch) + Verify Env
+        btns = ttk.Frame(out_frame)
+        btns.grid(row=5, column=4, sticky=tk.W, padx=(8,0))
+        self.download_btn = ttk.Button(btns, text="Download Models", command=self.download_models_ui)
+        self.download_btn.pack(side=tk.LEFT)
+        self.verify_btn = ttk.Button(btns, text="Verify Env", command=self.verify_environment)
+        self.verify_btn.pack(side=tk.LEFT, padx=(6,0))
 
         # Freeform model path/name
         self.model_var = tk.StringVar(value="yolov8n.pt")
@@ -228,6 +502,87 @@ class DataProcessorApp(tk.Tk):
         ttk.Entry(base_frame, textvariable=self.image_base_dir_var, width=60).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(base_frame, text="Browse...", command=self.browse_image_base_dir).pack(side=tk.LEFT, padx=(6,0))
 
+        # Preprocessing
+        pre_frame = ttk.LabelFrame(container, text="Preprocessing (optional)", padding=10)
+        pre_frame.pack(fill=tk.X, expand=False, pady=(0, 8))
+
+        ttk.Checkbutton(pre_frame, text="Enable preprocessing", variable=self.do_preprocess_var).grid(row=0, column=0, sticky=tk.W, pady=4)
+
+        ttk.Label(pre_frame, text="Missing strategy:").grid(row=1, column=0, sticky=tk.E)
+        self._missing_options = [
+            "None",
+            "Drop rows",
+            "Fill numeric mean",
+            "Fill numeric median",
+            "Fill num mean + cat mode",
+            "Fill num median + cat mode",
+            "Fill with 0/''",
+            "FFill",
+            "BFill",
+        ]
+        self.missing_combo = ttk.Combobox(pre_frame, textvariable=self.missing_strategy_var, values=self._missing_options, state="readonly", width=28)
+        self.missing_combo.grid(row=1, column=1, sticky=tk.W, pady=2)
+
+        ttk.Label(pre_frame, text="Scaling:").grid(row=1, column=2, sticky=tk.E)
+        self._scaling_options = ["None", "Standardize (Z-score)", "Min-Max [0,1]"]
+        self.scaling_combo = ttk.Combobox(pre_frame, textvariable=self.scaling_var, values=self._scaling_options, state="readonly", width=22)
+        self.scaling_combo.grid(row=1, column=3, sticky=tk.W, pady=2)
+
+        ttk.Label(pre_frame, text="Encoding:").grid(row=1, column=4, sticky=tk.E)
+        self._encoding_options = ["None", "One-Hot", "Label/Ordinal"]
+        self.encoding_combo = ttk.Combobox(pre_frame, textvariable=self.encoding_var, values=self._encoding_options, state="readonly", width=18)
+        self.encoding_combo.grid(row=1, column=5, sticky=tk.W, pady=2)
+
+        self.onehot_include_nan_chk = ttk.Checkbutton(pre_frame, text="One-hot: include NaN", variable=self.onehot_include_nan_var)
+        self.onehot_include_nan_chk.grid(row=1, column=6, sticky=tk.W, padx=(8,0))
+
+        # Exclude/include columns
+        ttk.Label(pre_frame, text="Exclude columns:").grid(row=2, column=0, sticky=tk.E, pady=(6,2))
+        ttk.Entry(pre_frame, textvariable=self.preproc_exclude_cols_var, width=70).grid(row=2, column=1, columnspan=3, sticky=tk.W)
+
+        ttk.Label(pre_frame, text="Include numeric cols:").grid(row=3, column=0, sticky=tk.E)
+        ttk.Entry(pre_frame, textvariable=self.preproc_include_num_cols_var, width=70).grid(row=3, column=1, columnspan=3, sticky=tk.W)
+
+        ttk.Label(pre_frame, text="Include categorical cols:").grid(row=4, column=0, sticky=tk.E)
+        ttk.Entry(pre_frame, textvariable=self.preproc_include_cat_cols_var, width=70).grid(row=4, column=1, columnspan=3, sticky=tk.W)
+
+        self.drop_nonfinite_chk = ttk.Checkbutton(pre_frame, text="Drop rows with NaN/Inf after transforms", variable=self.drop_nonfinite_after_scale_var)
+        self.drop_nonfinite_chk.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(6,2))
+
+        def _toggle_preproc_state(*_):
+            on = bool(self.do_preprocess_var.get())
+            state = "normal" if on else "disabled"
+            for w in [self.missing_combo, self.scaling_combo, self.encoding_combo, self.onehot_include_nan_chk,
+                      self.drop_nonfinite_chk]:
+                try:
+                    w.configure(state=state)
+                except Exception:
+                    pass
+            # text entries use configure(state=)
+            for child in [
+                (pre_frame.grid_slaves(row=2, column=1)[0] if pre_frame.grid_slaves(row=2, column=1) else None),
+                (pre_frame.grid_slaves(row=3, column=1)[0] if pre_frame.grid_slaves(row=3, column=1) else None),
+                (pre_frame.grid_slaves(row=4, column=1)[0] if pre_frame.grid_slaves(row=4, column=1) else None),
+            ]:
+                if child is not None:
+                    try:
+                        child.configure(state=state)
+                    except Exception:
+                        pass
+            # One-hot dependent
+            onehot_state = state if (on and self.encoding_var.get().lower().startswith("one-hot")) else "disabled"
+            try:
+                self.onehot_include_nan_chk.configure(state=onehot_state)
+            except Exception:
+                pass
+
+        def _toggle_onehot(*_):
+            _toggle_preproc_state()
+
+        _toggle_preproc_state()
+        self.do_preprocess_var.trace_add('write', lambda *_: _toggle_preproc_state())
+        self.encoding_combo.bind("<<ComboboxSelected>>", lambda e: _toggle_onehot())
+
         # Split settings
         split_frame = ttk.LabelFrame(container, text="Train/Val/Test Split (optional)", padding=10)
         split_frame.pack(fill=tk.X, expand=False, pady=(0, 8))
@@ -260,8 +615,17 @@ class DataProcessorApp(tk.Tk):
         # Log output
         log_frame = ttk.LabelFrame(container, text="Log", padding=8)
         log_frame.pack(fill=tk.BOTH, expand=True)
-        self.log_text = tk.Text(log_frame, height=12, wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        # Wrap Text and Scrollbar in a frame to use grid for proper resizing
+        log_body = ttk.Frame(log_frame)
+        log_body.pack(fill=tk.BOTH, expand=True)
+        self.log_text = tk.Text(log_body, height=12, wrap=tk.WORD)
+        yscroll = ttk.Scrollbar(log_body, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=yscroll.set)
+        # Layout with grid
+        self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
+        yscroll.grid(row=0, column=1, sticky=tk.NS)
+        log_body.columnconfigure(0, weight=1)
+        log_body.rowconfigure(0, weight=1)
 
     # UI helpers
     def browse_input(self):
@@ -292,6 +656,68 @@ class DataProcessorApp(tk.Tk):
         self.log_text.see(tk.END)
         self.update_idletasks()
 
+    def _ask_radio_choice(self, title: str, message: str, options: list[str], default_index: int = 0) -> str | None:
+        """Modal dialog with radio buttons for a non-typable choice.
+
+        Returns the selected option string, or None if cancelled.
+        Must be called on the Tk main thread.
+        """
+        if not options:
+            return None
+        try:
+            dlg = tk.Toplevel(self)
+            dlg.title(title)
+            dlg.transient(self)
+            dlg.resizable(False, False)
+            dlg.grab_set()
+
+            result: dict[str, str | None] = {"value": None}
+            var = tk.StringVar(value=options[min(max(default_index, 0), len(options) - 1)])
+
+            body = ttk.Frame(dlg, padding=12)
+            body.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(body, text=message).pack(anchor=tk.W, pady=(0,6))
+            for opt in options:
+                ttk.Radiobutton(body, text=opt, variable=var, value=opt).pack(anchor=tk.W)
+
+            btns = ttk.Frame(body)
+            btns.pack(fill=tk.X, pady=(10,0))
+
+            def on_ok():
+                result["value"] = var.get()
+                dlg.destroy()
+
+            def on_cancel():
+                result["value"] = None
+                dlg.destroy()
+
+            ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
+            ttk.Button(btns, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=(0,6))
+
+            def on_close():
+                on_cancel()
+            dlg.protocol("WM_DELETE_WINDOW", on_close)
+
+            # Center dialog over parent
+            dlg.update_idletasks()
+            try:
+                px = self.winfo_rootx()
+                py = self.winfo_rooty()
+                pw = self.winfo_width()
+                ph = self.winfo_height()
+                dw = dlg.winfo_reqwidth()
+                dh = dlg.winfo_reqheight()
+                x = px + (pw - dw) // 2
+                y = py + (ph - dh) // 2
+                dlg.geometry(f"{dw}x{dh}+{max(x,0)}+{max(y,0)}")
+            except Exception:
+                pass
+
+            dlg.wait_window()
+            return result["value"]
+        except Exception:
+            return None
+
     def _config_dir(self) -> str:
         # Use AppData/Roaming on Windows, otherwise home dir
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
@@ -311,11 +737,21 @@ class DataProcessorApp(tk.Tk):
             self.base_name_var.set(cfg.get("base_name", "dataset"))
             self.format_var.set(cfg.get("format", "CSV"))
             self.cols_var.set(cfg.get("keep_cols", ""))
+            # Preprocessing
+            self.do_preprocess_var.set(bool(cfg.get("do_preprocess", False)))
+            self.missing_strategy_var.set(cfg.get("missing_strategy", "None"))
+            self.scaling_var.set(cfg.get("scaling", "None"))
+            self.encoding_var.set(cfg.get("encoding", "None"))
+            self.preproc_exclude_cols_var.set(cfg.get("preproc_exclude_cols", "image_path,audio_path,file_path,label"))
+            self.preproc_include_num_cols_var.set(cfg.get("preproc_include_num_cols", ""))
+            self.preproc_include_cat_cols_var.set(cfg.get("preproc_include_cat_cols", ""))
+            self.onehot_include_nan_var.set(bool(cfg.get("onehot_include_nan", False)))
+            self.drop_nonfinite_after_scale_var.set(bool(cfg.get("drop_nonfinite_after_scale", False)))
             # Neural
             self.mode_var.set(cfg.get("processing_mode", "Standard"))
             self.task_var.set(cfg.get("neural_task", "Detection"))
             self.engine_var.set(cfg.get("neural_engine", "Ultralytics YOLO"))
-            self.model_var.set(cfg.get("neural_model", "yolov8n.pt"))
+            self.preset_model_var.set(cfg.get("neural_preset", "yolov8n.pt"))
             self.conf_var.set(str(cfg.get("neural_conf", 0.25)))
             self.overwrite_var.set(bool(cfg.get("neural_overwrite", False)))
             # Image path helpers
@@ -338,6 +774,16 @@ class DataProcessorApp(tk.Tk):
             "base_name": self.base_name_var.get().strip() or "dataset",
             "format": self.format_var.get(),
             "keep_cols": self.cols_var.get().strip(),
+            # Preprocessing
+            "do_preprocess": bool(self.do_preprocess_var.get()),
+            "missing_strategy": self.missing_strategy_var.get(),
+            "scaling": self.scaling_var.get(),
+            "encoding": self.encoding_var.get(),
+            "preproc_exclude_cols": self.preproc_exclude_cols_var.get().strip(),
+            "preproc_include_num_cols": self.preproc_include_num_cols_var.get().strip(),
+            "preproc_include_cat_cols": self.preproc_include_cat_cols_var.get().strip(),
+            "onehot_include_nan": bool(self.onehot_include_nan_var.get()),
+            "drop_nonfinite_after_scale": bool(self.drop_nonfinite_after_scale_var.get()),
             "do_split": bool(self.do_split_var.get()),
             "train_ratio": float(self.train_ratio_var.get() or 0),
             "val_ratio": float(self.val_ratio_var.get() or 0),
@@ -346,7 +792,8 @@ class DataProcessorApp(tk.Tk):
             # Neural
             "processing_mode": self.mode_var.get(),
             "neural_task": self.task_var.get(),
-            "neural_engine": getattr(self, 'engine_var', tk.StringVar(value="Ultralytics YOLO")).get(),
+            "neural_engine": self.engine_var.get(),
+            "neural_preset": self.preset_model_var.get(),
             "neural_model": self.model_var.get(),
             "neural_conf": float(self.conf_var.get() or 0.25),
             "neural_overwrite": bool(self.overwrite_var.get()),
@@ -361,12 +808,990 @@ class DataProcessorApp(tk.Tk):
         except Exception:
             pass
 
+    def _pkg_version(self, name: str) -> str | None:
+        """Return installed package version or None if not available."""
+        try:
+            from importlib.metadata import version, PackageNotFoundError  # py3.8+
+            try:
+                return version(name)
+            except PackageNotFoundError:
+                return None
+        except Exception:
+            return None
+
+    def _collect_versions(self) -> dict:
+        """Collect versions of core libs that may change during installs."""
+        return {
+            "numpy": self._pkg_version("numpy"),
+            "torch": self._pkg_version("torch"),
+            "torchvision": self._pkg_version("torchvision"),
+            "ultralytics": self._pkg_version("ultralytics"),
+            "pillow": self._pkg_version("pillow"),
+            "opencv-python": self._pkg_version("opencv-python"),
+            "matplotlib": self._pkg_version("matplotlib"),
+        }
+
     def _on_close(self):
         self._save_settings()
         self.destroy()
 
     def _show_about(self):
-        messagebox.showinfo("About", f"{APP_NAME} v{APP_VERSION}\nConvert raw CSV to ML-ready datasets.\n© 2025")
+        msg = (
+            f"{APP_NAME} v{APP_VERSION}\n"
+            "Convert raw CSV to ML-ready datasets.\n"
+            "© 2025\n\n"
+            "See Help for GPU guidance and links."
+        )
+        messagebox.showinfo("About", msg)
+
+    def _show_help(self):
+        win = tk.Toplevel(self)
+        win.title("Help")
+        win.geometry("780x560")
+
+        container = ttk.Frame(win)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        text = tk.Text(container, wrap="word", padx=10, pady=10)
+        scroll = ttk.Scrollbar(container, command=text.yview)
+        # Default to arrow cursor for general help text
+        text.configure(yscrollcommand=scroll.set, cursor="arrow")
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Styling for headings
+        text.tag_configure("h1", font=(None, 12, "bold"))
+        text.tag_configure("h2", font=(None, 10, "bold"))
+        text.tag_configure("mono", font=("Consolas", 9))
+        # Show I-beam only over monospace snippets
+        text.tag_bind("mono", "<Enter>", lambda _e: text.configure(cursor="xterm"))
+        text.tag_bind("mono", "<Leave>", lambda _e: text.configure(cursor="arrow"))
+
+        link_count = {"n": 0}
+        def add_link(label: str, url: str):
+            tag = f"link{link_count['n']}"
+            link_count["n"] += 1
+            pos = text.index("end-1c")
+            text.insert("end", label + "\n")
+            text.tag_add(tag, pos, f"{pos}+{len(label)}c")
+            text.tag_config(tag, foreground="#1a73e8", underline=1)
+            text.tag_bind(tag, "<Button-1>", lambda _e, u=url: webbrowser.open(u))
+            # Hand cursor on hover over links
+            text.tag_bind(tag, "<Enter>", lambda _e: text.configure(cursor="hand2"))
+            text.tag_bind(tag, "<Leave>", lambda _e: text.configure(cursor="arrow"))
+
+        # Content (exact user text)
+        text.insert("end", "Windows – NVIDIA GPU\n", ("h1",))
+        text.insert("end", "\n")
+
+        text.insert("end", "PyTorch (CUDA)\n", ("h2",))
+        text.insert("end", "As of PyTorch 2.1.0 (latest), binaries support CUDA 11.8 and CUDA 12.1. Done—no need to overthink it.\n\n")
+        text.insert("end", "If you're after legacy options, older PyTorch versions on both Linux and Windows supported:\n\n")
+        text.insert("end", "CUDA 8.0, 9.0, 10.0\n\n")
+        text.insert("end", "Summary: Supported CUDA versions for Windows (NVIDIA + PyTorch):\n\n")
+        text.insert("end", "Current: CUDA 11.8, CUDA 12.1\n\n")
+        text.insert("end", "Legacy: CUDA 10.0, 9.0, 8.0\n\n")
+
+        text.insert("end", "Links (PyTorch):\n")
+        add_link("  • PyTorch Get Started", "https://pytorch.org/get-started/locally/")
+        add_link("  • Previous versions", "https://pytorch.org/get-started/previous-versions/")
+        text.insert("end", "\n\n")
+        text.insert("end", "Install (examples):\n")
+        text.insert("end", "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121\n", ("mono",))
+        text.insert("end", "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118\n", ("mono",))
+        text.insert("end", "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu  # CPU only\n", ("mono",))
+        text.insert("end", "\n")
+
+        text.insert("end", "—\n\n")
+
+        text.insert("end", "TensorFlow\n", ("h2",))
+        text.insert("end", "- Windows native GPU support ends at TF 2.10.1. Known working combo: TF 2.10.x + CUDA 11.2 + cuDNN 8.1.1.\n")
+        text.insert("end", "- For TF > 2.10 on Windows: use WSL2 (Ubuntu) and follow Linux GPU guidance (e.g., CUDA 12.3 + cuDNN 8.9.7).\n")
+        text.insert("end", "Links (TensorFlow):\n")
+        add_link("  • Install TensorFlow with pip", "https://www.tensorflow.org/install/pip")
+        add_link("  • GPU compatibility matrix (CUDA/cuDNN)", "https://www.tensorflow.org/install/source#gpu")
+        add_link("  • Linux pip install guide", "https://www.tensorflow.org/install/pip#linux")
+        add_link("  • Set up WSL2 on Windows", "https://learn.microsoft.com/windows/wsl/install")
+        text.insert("end", "\nInstall (Windows, GPU up to TF 2.10):\n")
+        text.insert("end", "pip install \"tensorflow==2.10.*\"\n", ("mono",))
+        text.insert("end", "# Then install CUDA 11.2 + cuDNN 8.1.1 from NVIDIA (see links above)\n", ("mono",))
+        text.insert("end", "Install (Windows, CPU):\n")
+        text.insert("end", "pip install tensorflow\n", ("mono",))
+
+        # Additional platforms
+        text.insert("end", "\n\nWindows – AMD/Intel (DirectML)\n", ("h2",))
+        text.insert("end", "Use Microsoft's DirectML builds for GPU acceleration on AMD/Intel GPUs on Windows.\n")
+        text.insert("end", "CUDA is NVIDIA-only; ROCm is not supported on Windows.\n")
+        text.insert("end", "Links:\n")
+        add_link("  • PyTorch on DirectML (Windows)", "https://learn.microsoft.com/windows/ai/directml/gpu-pytorch-windows")
+        add_link("  • TensorFlow on DirectML (Windows)", "https://learn.microsoft.com/windows/ai/directml/gpu-tensorflow-windows")
+        add_link("  • DirectML overview", "https://learn.microsoft.com/windows/ai/directml/dml-intro")
+        add_link("  • Hardware requirements (DirectML)", "https://learn.microsoft.com/windows/ai/directml/gpu-pytorch-windows#hardware-requirements")
+        text.insert("end", "\nInstall (examples):\n")
+        text.insert("end", "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu\n", ("mono",))
+        text.insert("end", "pip install torch-directml\n", ("mono",))
+        text.insert("end", "pip install tensorflow-directml\n", ("mono",))
+
+        text.insert("end", "\nLinux – NVIDIA\n", ("h2",))
+        text.insert("end", "PyTorch: use official wheels for CUDA 11.8 or 12.1.\n")
+        text.insert("end", "TensorFlow: follow Linux GPU guide (e.g., CUDA 12.3 + cuDNN 8.9.7).\n")
+        text.insert("end", "Links:\n")
+        add_link("  • PyTorch Get Started (Linux)", "https://pytorch.org/get-started/locally/")
+        add_link("  • TensorFlow Linux pip install", "https://www.tensorflow.org/install/pip#linux")
+        add_link("  • NVIDIA CUDA Toolkit downloads", "https://developer.nvidia.com/cuda-downloads")
+        add_link("  • NVIDIA cuDNN downloads", "https://developer.nvidia.com/cudnn")
+        add_link("  • CUDA driver/toolkit compatibility", "https://docs.nvidia.com/deploy/cuda-compatibility/")
+        text.insert("end", "\nInstall (PyTorch CUDA wheels):\n")
+        text.insert("end", "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121\n", ("mono",))
+        text.insert("end", "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118\n", ("mono",))
+        text.insert("end", "Install (TensorFlow):\n")
+        text.insert("end", "pip install tensorflow\n", ("mono",))
+
+        text.insert("end", "\nLinux – AMD (ROCm)\n", ("h2",))
+        text.insert("end", "Use ROCm-enabled builds. Check GPU support list and driver/ROCm version compatibility.\n")
+        text.insert("end", "Links:\n")
+        add_link("  • PyTorch ROCm (select ROCm in Get Started)", "https://pytorch.org/get-started/locally/")
+        add_link("  • AMD ROCm docs (install on Linux)", "https://rocm.docs.amd.com/")
+        add_link("  • TensorFlow on ROCm (AMD guide)", "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/how-to/tensorflow-install.html")
+        add_link("  • ROCm GPU support matrix", "https://rocm.docs.amd.com/en/latest/release/gpu_support.html")
+        text.insert("end", "\nInstall (PyTorch ROCm):\n")
+        text.insert("end", "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.1\n", ("mono",))
+        text.insert("end", "Install (TensorFlow ROCm):\n")
+        text.insert("end", "pip install tensorflow-rocm\n", ("mono",))
+
+        text.insert("end", "\nWindows + WSL2 (NVIDIA)\n", ("h2",))
+        text.insert("end", "For TensorFlow > 2.10 on Windows, use WSL2 for native NVIDIA CUDA support.\n")
+        text.insert("end", "Links:\n")
+        add_link("  • CUDA on WSL2 (NVIDIA guide)", "https://docs.nvidia.com/cuda/wsl-user-guide/index.html")
+        add_link("  • Install WSL", "https://learn.microsoft.com/windows/wsl/install")
+        text.insert("end", "\nInstall inside Ubuntu (examples):\n")
+        text.insert("end", "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121\n", ("mono",))
+        text.insert("end", "pip install tensorflow\n", ("mono",))
+
+        text.configure(state="disabled")
+
+    def _has_nvidia_gpu(self) -> bool:
+        """Best-effort check for an NVIDIA GPU using nvidia-smi."""
+        try:
+            p = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=3)
+            return p.returncode == 0 and ("GPU" in (p.stdout or ""))
+        except Exception:
+            return False
+
+    def verify_environment(self):
+        """Spawn a subprocess to import core libs and print versions; show results in log."""
+        try:
+            python_exe = sys.executable
+            script = (
+                "import importlib, json, sys\n"
+                "mods=['python','numpy','pandas','pyarrow','PIL','torch','torchvision','ultralytics','tensorflow','opencv-python','matplotlib','sklearn','xgboost','lightgbm','flaml']\n"
+                "vers={}\n"
+                "vers['python']=sys.version.split()[0]\n"
+                "def ver(name):\n"
+                "  try:\n"
+                "    if name=='PIL':\n"
+                "      import PIL; return getattr(PIL, '__version__', 'unknown')\n"
+                "    if name=='opencv-python':\n"
+                "      import cv2; return getattr(cv2, '__version__', 'unknown')\n"
+                "    if name=='python': return vers['python']\n"
+                "    m=importlib.import_module(name)\n"
+                "    return getattr(m,'__version__', 'unknown')\n"
+                "  except Exception as e:\n"
+                "    return None\n"
+                "for m in mods:\n"
+                "  vers[m]=ver(m)\n"
+                "flaml_info={'has_automl': None, 'error': None}\n"
+                "try:\n"
+                "  from flaml.automl import AutoML\n"
+                "  flaml_info['has_automl']=True\n"
+                "except Exception as e:\n"
+                "  flaml_info['has_automl']=False\n"
+                "  try:\n"
+                "    flaml_info['error']=str(e)\n"
+                "  except Exception:\n"
+                "    flaml_info['error']=repr(e)\n"
+                "cuda={'available': None, 'version': None, 'device_count': 0, 'devices': [], 'nvidia_smi': None}\n"
+                "try:\n"
+                "  import torch\n"
+                "  cuda['available']=bool(torch.cuda.is_available())\n"
+                "  cuda['version']=getattr(torch.version,'cuda', None)\n"
+                "  try:\n"
+                "    cnt=torch.cuda.device_count()\n"
+                "  except Exception:\n"
+                "    cnt=0\n"
+                "  cuda['device_count']=cnt\n"
+                "  try:\n"
+                "    cuda['devices']=[torch.cuda.get_device_name(i) for i in range(cnt)]\n"
+                "  except Exception:\n"
+                "    pass\n"
+                "except Exception:\n"
+                "  pass\n"
+                "try:\n"
+                "  import subprocess\n"
+                "  smi=subprocess.run(['nvidia-smi','-L'], capture_output=True, text=True)\n"
+                "  cuda['nvidia_smi']=(smi.returncode==0)\n"
+                "except Exception:\n"
+                "  cuda['nvidia_smi']=None\n"
+                "print(json.dumps({'versions':vers,'cuda':cuda,'flaml':flaml_info}, indent=2))\n"
+            )
+            cmd = [python_exe, "-c", script]
+            self._start_progress("Verifying environment", style="Green.Horizontal.TProgressbar")
+            def run():
+                self._run_ps_step(cmd, "Verify Environment")
+                self.after(0, self._end_progress)
+            import threading
+            threading.Thread(target=run, daemon=True).start()
+        except Exception as e:
+            self.log(f"Verify environment failed: {e}")
+
+    def setup_environment_ui(self):
+        """Install core/optional dependencies in current Python. Asks for confirmation."""
+        if not messagebox.askyesno(
+            "Setup Environment",
+            "This will install or update recommended packages in the CURRENT Python environment:\n\n"
+            "- Core: pandas, pyarrow, Pillow, openpyxl\n"
+            "- ML (optional): torch, torchvision, torchaudio (CUDA if NVIDIA GPU detected, else CPU), ultralytics, scikit-learn\n"
+            "- Optional: tensorflow (for TFRecord)\n\nProceed?"
+        ):
+            return
+        python_exe = sys.executable
+        steps: list[tuple[list[str], str]] = []
+        # Core
+        steps.append(([python_exe, "-m", "pip", "install", "--upgrade", "pip"], "Upgrade pip"))
+        steps.append(([python_exe, "-m", "pip", "install", "pandas", "pyarrow", "Pillow", "openpyxl"], "Install core packages"))
+        # Torch/TorchVision: prefer CUDA wheels if NVIDIA GPU is present
+        try:
+            prefer_cuda = self._has_nvidia_gpu()
+        except Exception:
+            prefer_cuda = False
+        torch_index = "https://download.pytorch.org/whl/cu124" if prefer_cuda else "https://download.pytorch.org/whl/cpu"
+        torch_label = "Install Torch/TorchVision (CUDA cu124)" if prefer_cuda else "Install Torch/TorchVision (CPU)"
+        steps.append(([python_exe, "-m", "pip", "install", "torch", "torchvision", "torchaudio", "--index-url", torch_index], torch_label))
+        # scikit-learn for robust splitting and metrics
+        steps.append(([python_exe, "-m", "pip", "install", "scikit-learn"], "Install scikit-learn"))
+        # FLAML with AutoML extra
+        steps.append(([python_exe, "-m", "pip", "install", "flaml[automl]"], "Install FLAML AutoML"))
+        # Ultralytics with only-if-needed and pin current numpy
+        cur_numpy = self._pkg_version("numpy")
+        ul = [python_exe, "-m", "pip", "install", "--upgrade-strategy", "only-if-needed", "ultralytics"]
+        if cur_numpy:
+            ul += [f"numpy=={cur_numpy}"]
+        steps.append((ul, "Install Ultralytics"))
+        # Optional TensorFlow step (best-effort)
+        steps.append(([python_exe, "-m", "pip", "install", "tensorflow"], "Install TensorFlow (optional)"))
+
+        self._start_progress("Setting up environment", style="Green.Horizontal.TProgressbar")
+        self.log("Starting environment setup...")
+        def worker():
+            for cmd, label in steps:
+                self._run_ps_step(cmd, label)
+            self.after(0, self._end_progress)
+            # Show versions after setup
+            try:
+                self.after(0, self.verify_environment)
+            except Exception:
+                pass
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_ml_training_page(self):
+        """Show the ML Training Page as an in-window tab and initialize it."""
+        try:
+            if hasattr(self, "notebook") and hasattr(self, "ml_tab"):
+                try:
+                    self.notebook.select(self.ml_tab)
+                except Exception:
+                    pass
+                # Initialize ML tab lazily
+                try:
+                    init = getattr(self, "_init_ml_tab", None)
+                    if callable(init):
+                        init()
+                except Exception:
+                    pass
+            else:
+                messagebox.showerror("ML Training Page", "Main notebook is not available yet.")
+        except Exception as e:
+            messagebox.showerror("ML Training Page", f"Failed to open ML Training Page tab: {e}")
+
+    def open_env_checker_page(self):
+        """Show the Environment Checker tab and initialize it."""
+        try:
+            if hasattr(self, "notebook") and hasattr(self, "env_tab"):
+                try:
+                    self.notebook.select(self.env_tab)
+                except Exception:
+                    pass
+                try:
+                    init = getattr(self, "_init_env_tab", None)
+                    if callable(init):
+                        init()
+                except Exception:
+                    pass
+            else:
+                messagebox.showerror("Environment Checker", "Main notebook is not available yet.")
+        except Exception as e:
+            messagebox.showerror("Environment Checker", f"Failed to open Environment Checker tab: {e}")
+
+    def _env_log(self, msg: str):
+        """Append a line to the Environment Checker output box."""
+        try:
+            txt = getattr(self, "_env_out_text", None)
+            if txt is None:
+                self.log(msg)
+                return
+            def _append():
+                try:
+                    txt.configure(state=tk.NORMAL)
+                    txt.insert(tk.END, msg + "\n")
+                    txt.see(tk.END)
+                    txt.configure(state=tk.DISABLED)
+                except Exception:
+                    pass
+            self.after(0, _append)
+        except Exception:
+            pass
+
+    def _env_set_summary(self, text: str):
+        try:
+            box = getattr(self, "_env_summary_text", None)
+            if box is None:
+                return
+            def _set():
+                try:
+                    box.configure(state=tk.NORMAL)
+                    box.delete("1.0", tk.END)
+                    box.insert(tk.END, text)
+                    box.configure(state=tk.DISABLED)
+                except Exception:
+                    pass
+            self.after(0, _set)
+        except Exception:
+            pass
+
+    def env_detect_gpu(self):
+        """Detect NVIDIA GPU via nvidia-smi and framework visibility (TF/Torch)."""
+        def worker():
+            status = self._env_status if hasattr(self, "_env_status") else {}
+            gpu = {"present": False, "name": None, "count": 0}
+            try:
+                p = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5)
+                if p.returncode == 0 and p.stdout:
+                    lines = [ln for ln in (p.stdout or "").strip().splitlines() if "GPU" in ln]
+                    gpu["present"] = len(lines) > 0
+                    gpu["count"] = len(lines)
+                    gpu["name"] = lines[0].split("(")[0].split(":",1)[-1].strip() if lines else None
+                    self._env_log(f"nvidia-smi: {gpu['count']} GPU(s) detected: {gpu['name']}")
+                else:
+                    self._env_log("nvidia-smi not found or no NVIDIA GPU detected.")
+            except Exception as e:
+                self._env_log(f"nvidia-smi check failed: {e}")
+
+            # TensorFlow visibility
+            tf_gpu = None
+            try:
+                import tensorflow as tf  # type: ignore
+                gpus = tf.config.list_physical_devices('GPU')
+                tf_gpu = len(gpus) > 0
+                self._env_log(f"TensorFlow GPUs: {len(gpus)}")
+            except Exception as e:
+                self._env_log(f"TensorFlow GPU check skipped: {e}")
+
+            # PyTorch visibility
+            torch_gpu = None
+            try:
+                import torch  # type: ignore
+                torch_gpu = bool(torch.cuda.is_available())
+                self._env_log(f"PyTorch CUDA available: {torch_gpu}")
+            except Exception as e:
+                self._env_log(f"PyTorch GPU check skipped: {e}")
+
+            status["gpu"] = {"ok": bool(gpu["present"]), "detail": gpu, "tf_visible": tf_gpu, "torch_visible": torch_gpu}
+            self._env_status = status
+            self.env_refresh_summary()
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def env_check_frameworks(self):
+        """Check frameworks presence, versions, and do small sanity tests (CPU/GPU where lightweight)."""
+        def worker():
+            status = self._env_status if hasattr(self, "_env_status") else {}
+
+            # TensorFlow
+            try:
+                import tensorflow as tf  # type: ignore
+                ver = getattr(tf, "__version__", "?")
+                try:
+                    _ = (tf.constant(1) + tf.constant(2)).numpy()
+                    simple_ok = True
+                except Exception:
+                    simple_ok = False
+                gpus = []
+                try:
+                    gpus = tf.config.list_physical_devices('GPU')
+                except Exception:
+                    pass
+                tf_ok = simple_ok
+                self._env_log(f"TensorFlow {ver}: basic ops={'ok' if simple_ok else 'fail'}, GPUs={len(gpus)}")
+                status["tensorflow"] = {"ok": tf_ok, "version": ver, "gpu_ready": len(gpus) > 0}
+            except Exception as e:
+                self._env_log(f"TensorFlow import failed: {e}")
+                status["tensorflow"] = {"ok": False, "error": str(e)}
+
+            # scikit-learn
+            try:
+                import sklearn  # type: ignore
+                from sklearn.linear_model import LogisticRegression  # type: ignore
+                ver = getattr(sklearn, "__version__", "?")
+                import numpy as _np
+                X = _np.random.randn(50, 4)
+                y = (_np.sum(X[:, :2], axis=1) > 0).astype(int)
+                LogisticRegression(max_iter=200).fit(X, y)
+                self._env_log(f"scikit-learn {ver}: LogisticRegression fit ok")
+                status["sklearn"] = {"ok": True, "version": ver}
+            except Exception as e:
+                self._env_log(f"scikit-learn check failed: {e}")
+                status["sklearn"] = {"ok": False, "error": str(e)}
+
+            # XGBoost
+            try:
+                import xgboost as xgb  # type: ignore
+                ver = getattr(xgb, "__version__", "?")
+                import numpy as _np
+                X = _np.random.randn(64, 4)
+                y = (_np.sum(X[:, :2], axis=1) > 0).astype(int)
+                d = xgb.DMatrix(X, label=y)
+                gpu_ready = False
+                try:
+                    xgb.train({"tree_method": "gpu_hist", "max_depth": 2, "verbosity": 0, "nthread": 1}, d, num_boost_round=1)
+                    gpu_ready = True
+                    self._env_log(f"XGBoost {ver}: gpu_hist ok")
+                except Exception as ge:
+                    self._env_log(f"XGBoost {ver}: gpu_hist not usable ({ge})")
+                    # CPU sanity
+                    try:
+                        xgb.train({"tree_method": "hist", "max_depth": 2, "verbosity": 0, "nthread": 1}, d, num_boost_round=1)
+                        self._env_log(f"XGBoost {ver}: CPU hist ok")
+                    except Exception as ce:
+                        self._env_log(f"XGBoost CPU hist failed: {ce}")
+                status["xgboost"] = {"ok": True, "version": ver, "gpu_ready": gpu_ready}
+            except Exception as e:
+                self._env_log(f"XGBoost check failed: {e}")
+                status["xgboost"] = {"ok": False, "error": str(e)}
+
+            # LightGBM
+            try:
+                import lightgbm as lgb  # type: ignore
+                ver = getattr(lgb, "__version__", "?")
+                import numpy as _np
+                X = _np.random.randn(64, 4)
+                y = (_np.sum(X[:, :2], axis=1) > 0).astype(int)
+                train = lgb.Dataset(X, label=y, free_raw_data=True)
+                gpu_ready = False
+                try:
+                    params = {"objective": "binary", "num_leaves": 15, "min_data_in_leaf": 5, "verbose": -1, "device": "gpu"}
+                    lgb.train(params, train, num_boost_round=5)
+                    gpu_ready = True
+                    self._env_log(f"LightGBM {ver}: GPU training ok")
+                except Exception as ge:
+                    self._env_log(f"LightGBM {ver}: GPU not usable ({ge})")
+                    try:
+                        params = {"objective": "binary", "num_leaves": 15, "min_data_in_leaf": 5, "verbose": -1}
+                        lgb.train(params, train, num_boost_round=5)
+                        self._env_log(f"LightGBM {ver}: CPU training ok")
+                    except Exception as ce:
+                        self._env_log(f"LightGBM CPU training failed: {ce}")
+                status["lightgbm"] = {"ok": True, "version": ver, "gpu_ready": gpu_ready}
+            except Exception as e:
+                self._env_log(f"LightGBM check failed: {e}")
+                status["lightgbm"] = {"ok": False, "error": str(e)}
+
+            # FLAML
+            try:
+                from flaml.automl import AutoML  # type: ignore
+                import flaml  # type: ignore
+                ver = getattr(flaml, "__version__", "?")
+                _ = AutoML  # symbol access
+                self._env_log(f"FLAML {ver}: import ok")
+                status["flaml"] = {"ok": True, "version": ver}
+            except Exception as e:
+                self._env_log(f"FLAML import failed: {e}")
+                status["flaml"] = {"ok": False, "error": str(e)}
+
+            self._env_status = status
+            self.env_refresh_summary()
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def env_install_upgrade_frameworks(self):
+        """Install/upgrade key ML frameworks in the current environment."""
+        if not messagebox.askyesno(
+            "Install/Upgrade",
+            "Install/upgrade key ML frameworks in the CURRENT Python environment?\n\nPackages: scikit-learn, xgboost, lightgbm, tensorflow, flaml[automl]"
+        ):
+            return
+        python_exe = sys.executable
+        steps: list[tuple[list[str], str]] = []
+        steps.append(([python_exe, "-m", "pip", "install", "-U", "scikit-learn"], "Install/Upgrade scikit-learn"))
+        steps.append(([python_exe, "-m", "pip", "install", "-U", "xgboost"], "Install/Upgrade XGBoost"))
+        steps.append(([python_exe, "-m", "pip", "install", "-U", "lightgbm"], "Install/Upgrade LightGBM"))
+        steps.append(([python_exe, "-m", "pip", "install", "-U", "tensorflow"], "Install/Upgrade TensorFlow"))
+        steps.append(([python_exe, "-m", "pip", "install", "-U", "flaml[automl]"], "Install/Upgrade FLAML"))
+
+        self._start_progress("Installing frameworks", style="Green.Horizontal.TProgressbar")
+        self._env_log("Starting framework installations...")
+        def worker():
+            for cmd, label in steps:
+                self._run_ps_step(cmd, label)
+            try:
+                self.after(0, self._end_progress)
+            except Exception:
+                pass
+            self._env_log("Install/upgrade completed. Re-run checks.")
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def env_install_frameworks(self):
+        """Install exact pinned versions from requirements2.txt excluding TensorFlow and PyTorch.
+        Shows progress and environment logs, and prompts users to install TF/PT manually after.
+        """
+        try:
+            if not messagebox.askyesno(
+                "Install Frameworks",
+                "Install exact pinned versions required for running the app (excluding TensorFlow and PyTorch) in the CURRENT Python environment?"
+            ):
+                return
+        except Exception:
+            # In headless contexts, proceed without prompt
+            pass
+
+        python_exe = sys.executable
+        req_path = os.path.join(os.path.dirname(__file__), "requirements2.txt")
+        if not os.path.isfile(req_path):
+            try:
+                messagebox.showerror("Install Frameworks", f"requirements2.txt not found at: {req_path}")
+            except Exception:
+                self._env_log(f"requirements2.txt not found at: {req_path}")
+            return
+
+        # Read and filter requirements, excluding TF/PT families
+        exclude = {"tensorflow", "tensorflow-rocm", "tensorflow-directml", "torch", "torchvision", "torchaudio"}
+        def base_name(line: str) -> str:
+            # Extract package name before any version specifiers or extras
+            s = line.strip()
+            if not s or s.startswith("#"):
+                return ""
+            # Stop at first comparator or whitespace
+            m = re.match(r"^([A-Za-z0-9_.\-]+)", s)
+            return (m.group(1) if m else s).strip()
+
+        try:
+            with open(req_path, "r", encoding="utf-8") as f:
+                lines = [ln.rstrip() for ln in f.readlines()]
+            filtered = []
+            for ln in lines:
+                name = base_name(ln).lower()
+                if not name:
+                    continue
+                # exclude families
+                if name in exclude or name.startswith("tensorflow") or name.startswith("torch"):
+                    continue
+                filtered.append(ln)
+        except Exception as e:
+            try:
+                messagebox.showerror("Install Frameworks", f"Failed to read requirements2.txt: {e}")
+            except Exception:
+                pass
+            self._env_log(f"Failed to read requirements2.txt: {e}")
+            return
+
+        if not filtered:
+            self._env_log("No packages to install after excluding TensorFlow/PyTorch.")
+            return
+
+        # Write to a temporary requirements file so pip installs exact pins
+        tmp_req = None
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as tf:
+                tf.write("\n".join(filtered) + "\n")
+                tmp_req = tf.name
+        except Exception as e:
+            self._env_log(f"Failed to create temp requirements file: {e}")
+            return
+
+        self._start_progress("Installing pinned frameworks", style="Green.Horizontal.TProgressbar")
+        self._env_log("Installing pinned packages (excluding TensorFlow/PyTorch)...")
+
+        def worker():
+            try:
+                cmd = [
+                    python_exe, "-m", "pip", "install",
+                    "--no-input", "--disable-pip-version-check", "--no-color",
+                    "-r", tmp_req,
+                ]
+                self._run_ps_step(cmd, "Install pinned frameworks (excluding TF/PT)")
+            finally:
+                try:
+                    if tmp_req and os.path.isfile(tmp_req):
+                        os.unlink(tmp_req)
+                except Exception:
+                    pass
+                try:
+                    self.after(0, self._end_progress)
+                except Exception:
+                    pass
+                self._env_log("Install completed. TensorFlow and PyTorch are excluded; install them manually via Help after this step.")
+                try:
+                    self.after(0, lambda: messagebox.showinfo(
+                        "Manual Step Required",
+                        "TensorFlow and PyTorch are excluded from this step. Go to Help for instructions to install them manually."
+                    ))
+                except Exception:
+                    pass
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def env_upgrade_frameworks(self):
+        """Upgrade frameworks on Linux, excluding TensorFlow and PyTorch families.
+        Builds the package list from requirements2.txt by stripping version pins.
+        """
+        if not sys.platform.startswith("linux"):
+            try:
+                messagebox.showinfo("Upgrade Frameworks", "This upgrade action is available on Linux only.")
+            except Exception:
+                pass
+            return
+        try:
+            if not messagebox.askyesno(
+                "Upgrade Frameworks (Linux)",
+                "Upgrade to latest versions on Linux for frameworks listed in requirements2.txt (excluding TensorFlow and PyTorch)?"
+            ):
+                return
+        except Exception:
+            pass
+
+        req_path = os.path.join(os.path.dirname(__file__), "requirements2.txt")
+        if not os.path.isfile(req_path):
+            try:
+                messagebox.showerror("Upgrade Frameworks", f"requirements2.txt not found at: {req_path}")
+            except Exception:
+                self._env_log(f"requirements2.txt not found at: {req_path}")
+            return
+
+        exclude = {"tensorflow", "tensorflow-rocm", "tensorflow-directml", "torch", "torchvision", "torchaudio"}
+        def base_name(line: str) -> str:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                return ""
+            m = re.match(r"^([A-Za-z0-9_.\-]+)", s)
+            return (m.group(1) if m else s).strip()
+
+        names: list[str] = []
+        seen = set()
+        try:
+            with open(req_path, "r", encoding="utf-8") as f:
+                for ln in f:
+                    s = (ln or "").strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    # Skip options and non-package requirements
+                    if s.startswith("-") or s.startswith("git+") or s.startswith("http://") or s.startswith("https://"):
+                        continue
+                    name = base_name(s).lower()
+                    if not name or name in exclude or name.startswith("tensorflow") or name.startswith("torch"):
+                        continue
+                    if name not in seen:
+                        names.append(name)
+                        seen.add(name)
+        except Exception as e:
+            self._env_log(f"Failed to read requirements2.txt: {e}")
+            return
+
+        if not names:
+            self._env_log("No packages to upgrade after excluding TensorFlow/PyTorch.")
+            return
+
+        # Chunk installs to keep command length reasonable
+        def chunks(lst: list[str], n: int):
+            for i in range(0, len(lst), n):
+                yield lst[i:i+n]
+
+        python_exe = sys.executable
+        pkgs = names
+        batches = list(chunks(pkgs, 20))
+        self._start_progress("Upgrading frameworks (Linux)", maximum=len(batches), style="Green.Horizontal.TProgressbar")
+        self._env_log(f"Upgrading {len(pkgs)} packages in {len(batches)} batch(es) (excluding TensorFlow/PyTorch)...")
+
+        def worker():
+            done = 0
+            for i, batch in enumerate(batches):
+                label = f"Upgrade batch {i+1}/{len(batches)}"
+                cmd = [python_exe, "-m", "pip", "install", "-U", "--no-input", "--disable-pip-version-check", "--no-color"] + batch
+                self._run_ps_step(cmd, label)
+                done += 1
+                try:
+                    self.after(0, lambda d=done: self._update_progress(d, f"{d}/{len(batches)}"))
+                except Exception:
+                    pass
+            try:
+                self.after(0, self._end_progress)
+            except Exception:
+                pass
+            self._env_log("Upgrade completed. TensorFlow and PyTorch are excluded; install/upgrade them manually as needed.")
+            try:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Manual Step Recommended",
+                    "TensorFlow and PyTorch were excluded from upgrade. Manage them manually per your GPU/OS guidance in Help."
+                ))
+            except Exception:
+                pass
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def env_calibrate_gpu(self):
+        """Interactive GPU calibration: prompt for OS and GPU vendor on the main thread,
+        then run installation steps asynchronously with progress and logging.
+
+        Flows:
+        - Windows + NVIDIA: PyTorch CUDA 12.4 wheels; TensorFlow 2.10.1 (CPU pip)
+        - Windows + AMD/Intel: PyTorch CPU + torch-directml + tensorflow-directml
+        - Linux + NVIDIA: prompt CUDA series (cu124/cu121/cu118) then install matching PyTorch; TensorFlow (pip)
+        - Linux + AMD: prompt ROCm series (e.g., rocm6.1), then PyTorch ROCm + tensorflow-rocm
+        """
+        try:
+            python_exe = sys.executable
+            # Prompts MUST be on the Tk main thread
+            default_os = "Windows" if sys.platform == "win32" else "Linux"
+            os_choice = self._ask_radio_choice(
+                title="Calibrate GPU",
+                message="Select Operating System:",
+                options=["Windows", "Linux"],
+                default_index=(0 if default_os == "Windows" else 1),
+            )
+            if not os_choice:
+                self._env_log("Calibration cancelled: OS not provided.")
+                return
+            os_key = os_choice.strip().lower()
+            if os_key not in ("windows", "linux"):
+                self._env_log(f"Invalid OS '{os_choice}'. Expected 'Windows' or 'Linux'.")
+                return
+
+            gpu_choice = self._ask_radio_choice(
+                title="Calibrate GPU",
+                message="Select GPU Vendor:",
+                options=["NVIDIA", "AMD/Intel"],
+                default_index=0,
+            )
+            if not gpu_choice:
+                self._env_log("Calibration cancelled: GPU vendor not provided.")
+                return
+            gpu_key = gpu_choice.strip().lower()
+
+            steps: list[tuple[list[str], str]] = []
+            if os_key == "windows":
+                if "nvidia" in gpu_key:
+                    # Let user choose CUDA series on Windows as well
+                    cuda_options = ["cu124", "cu121", "cu118"]
+                    cu_choice = self._ask_radio_choice(
+                        title="Calibrate GPU",
+                        message="Select CUDA series for PyTorch:",
+                        options=cuda_options,
+                        default_index=0,
+                    )
+                    if not cu_choice:
+                        self._env_log("Calibration cancelled: CUDA series not selected.")
+                        return
+                    cu_key = cu_choice.strip().lower()
+                    self._env_log(f"Selected: Windows + NVIDIA (PyTorch {cu_key}, TensorFlow CPU 2.10.1).")
+                    torch_index = f"https://download.pytorch.org/whl/{cu_key}"
+                    steps.append(([python_exe, "-m", "pip", "install", "-U", "pip"], "Upgrade pip"))
+                    steps.append(([python_exe, "-m", "pip", "install", "torch", "torchvision", "torchaudio", "--index-url", torch_index], f"Install PyTorch ({cu_key})"))
+                    steps.append(([python_exe, "-m", "pip", "install", "tensorflow==2.10.1"], "Install TensorFlow 2.10.1 (CPU on Windows)"))
+                else:
+                    self._env_log("Selected: Windows + AMD/Intel (DirectML).")
+                    steps.append(([python_exe, "-m", "pip", "install", "-U", "pip"], "Upgrade pip"))
+                    steps.append(([python_exe, "-m", "pip", "install", "torch", "torchvision", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cpu"], "Install PyTorch (CPU)"))
+                    steps.append(([python_exe, "-m", "pip", "install", "torch-directml"], "Install torch-directml"))
+                    steps.append(([python_exe, "-m", "pip", "install", "tensorflow-directml"], "Install tensorflow-directml"))
+            else:  # Linux
+                if "nvidia" in gpu_key:
+                    cuda_options = ["cu124", "cu121", "cu118"]
+                    cu_choice = self._ask_radio_choice(
+                        title="Calibrate GPU",
+                        message="Select CUDA series for PyTorch:",
+                        options=cuda_options,
+                        default_index=2,
+                    )
+                    if not cu_choice:
+                        self._env_log("Calibration cancelled: CUDA series not selected.")
+                        return
+                    cu_key = cu_choice.strip().lower()
+                    steps.append(([python_exe, "-m", "pip", "install", "-U", "pip"], "Upgrade pip"))
+                    steps.append(([python_exe, "-m", "pip", "install", "torch", "torchvision", "torchaudio", "--index-url", f"https://download.pytorch.org/whl/{cu_key}"], f"Install PyTorch ({cu_key})"))
+                    steps.append(([python_exe, "-m", "pip", "install", "tensorflow"], "Install TensorFlow"))
+                else:
+                    rocm_options = ["rocm6.1", "rocm6.0", "rocm5.7"]
+                    rocm_choice = self._ask_radio_choice(
+                        title="Calibrate GPU",
+                        message="Select ROCm series for PyTorch:",
+                        options=rocm_options,
+                        default_index=0,
+                    )
+                    if not rocm_choice:
+                        self._env_log("Calibration cancelled: ROCm series not selected.")
+                        return
+                    rocm_key = rocm_choice.strip().lower()
+                    steps.append(([python_exe, "-m", "pip", "install", "-U", "pip"], "Upgrade pip"))
+                    steps.append(([python_exe, "-m", "pip", "install", "torch", "torchvision", "torchaudio", "--index-url", f"https://download.pytorch.org/whl/{rocm_key}"], f"Install PyTorch ({rocm_key})"))
+                    steps.append(([python_exe, "-m", "pip", "install", "tensorflow-rocm"], "Install tensorflow-rocm"))
+
+            if not steps:
+                self._env_log("No steps generated; nothing to do.")
+                return
+
+            # Start progress UI before launching worker
+            self._start_progress("Calibrating GPU", style="Green.Horizontal.TProgressbar")
+
+            def worker():
+                try:
+                    self._env_log("Starting GPU calibration...")
+                    for cmd, label in steps:
+                        self._run_ps_step(cmd, label)
+                    self._env_log("GPU calibration completed. Running environment checks...")
+                    try:
+                        self.env_detect_gpu()
+                        self.env_check_frameworks()
+                        self.env_check_cuda_cudnn()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self._env_log(f"Calibration error: {e}")
+                finally:
+                    try:
+                        self.after(0, self._end_progress)
+                    except Exception:
+                        pass
+
+            import threading
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as e:
+            self._env_log(f"Calibration error: {e}")
+
+    def env_check_cuda_cudnn(self):
+        """Best-effort CUDA/cuDNN info and TensorFlow build metadata."""
+        def parse_nvcc_version(text: str) -> str | None:
+            for ln in (text or "").splitlines():
+                if "release" in ln and "Cuda compilation tools" in ln:
+                    # e.g., Cuda compilation tools, release 11.8, V11.8.89
+                    parts = ln.split("release")
+                    if len(parts) > 1:
+                        return parts[1].split(",")[0].strip()
+            return None
+
+        def worker():
+            status = self._env_status if hasattr(self, "_env_status") else {}
+            info = {"nvidia_smi_cuda": None, "nvcc_cuda": None, "tf_cuda": None, "tf_cudnn": None, "notes": []}
+            # nvidia-smi reported CUDA
+            try:
+                p = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
+                if p.returncode == 0 and p.stdout:
+                    for ln in p.stdout.splitlines():
+                        if "CUDA Version:" in ln:
+                            try:
+                                info["nvidia_smi_cuda"] = ln.split("CUDA Version:")[-1].strip().split(" ")[0]
+                            except Exception:
+                                pass
+                            break
+            except Exception as e:
+                self._env_log(f"nvidia-smi CUDA parse failed: {e}")
+
+            # nvcc --version
+            try:
+                p = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5)
+                if p.returncode == 0 and p.stdout:
+                    info["nvcc_cuda"] = parse_nvcc_version(p.stdout)
+            except Exception as e:
+                self._env_log(f"nvcc check failed: {e}")
+
+            # TensorFlow build info
+            try:
+                import tensorflow as tf  # type: ignore
+                bi = {}
+                try:
+                    bi = tf.sysconfig.get_build_info() or {}
+                except Exception:
+                    pass
+                cuda_v = bi.get("cuda_version") if isinstance(bi, dict) else None
+                cudnn_v = bi.get("cudnn_version") if isinstance(bi, dict) else None
+                info["tf_cuda"] = cuda_v
+                info["tf_cudnn"] = cudnn_v
+                self._env_log(f"TensorFlow build: CUDA={cuda_v}, cuDNN={cudnn_v}")
+                # Windows note for TF>=2.11
+                try:
+                    from packaging.version import Version
+                    tfv = Version(getattr(tf, "__version__", "0"))
+                    if sys.platform == "win32" and tfv >= Version("2.11"):
+                        info["notes"].append("On Windows, official TF>=2.11 pip builds do not include CUDA GPU support.")
+                except Exception:
+                    pass
+            except Exception as e:
+                self._env_log(f"TensorFlow build info unavailable: {e}")
+
+            status["cuda_cudnn"] = {"ok": True, "detail": info}
+            self._env_status = status
+            self.env_refresh_summary()
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def env_refresh_summary(self):
+        """Summarize statuses into the summary panel."""
+        status = getattr(self, "_env_status", {}) or {}
+        lines: list[str] = []
+        def flag(ok: bool | None) -> str:
+            if ok is True:
+                return "✅"
+            if ok is False:
+                return "❌"
+            return "⚠️"
+        # GPU
+        gpu = status.get("gpu")
+        if gpu:
+            present = bool(gpu.get("ok"))
+            name = (gpu.get("detail") or {}).get("name")
+            lines.append(f"{flag(present)} GPU: {'present' if present else 'not detected'}{(' - ' + str(name)) if name else ''}")
+        # TensorFlow
+        tf = status.get("tensorflow")
+        if tf:
+            lines.append(f"{flag(tf.get('ok'))} TensorFlow: v{tf.get('version','?')} (GPU ready: {bool(tf.get('gpu_ready'))})")
+        # scikit-learn
+        sk = status.get("sklearn")
+        if sk:
+            lines.append(f"{flag(sk.get('ok'))} scikit-learn: v{sk.get('version','?')}")
+        # XGBoost
+        xgb = status.get("xgboost")
+        if xgb:
+            lines.append(f"{flag(xgb.get('ok'))} XGBoost: v{xgb.get('version','?')} (GPU ready: {bool(xgb.get('gpu_ready'))})")
+        # LightGBM
+        lgb = status.get("lightgbm")
+        if lgb:
+            lines.append(f"{flag(lgb.get('ok'))} LightGBM: v{lgb.get('version','?')} (GPU ready: {bool(lgb.get('gpu_ready'))})")
+        # FLAML
+        fl = status.get("flaml")
+        if fl:
+            lines.append(f"{flag(fl.get('ok'))} FLAML: v{fl.get('version','?')}")
+        # CUDA/cuDNN
+        cc = status.get("cuda_cudnn")
+        if cc:
+            det = cc.get("detail") or {}
+            lines.append(
+                f"{flag(True)} CUDA/cuDNN: nvidia-smi CUDA={det.get('nvidia_smi_cuda')}, nvcc CUDA={det.get('nvcc_cuda')}, TF CUDA={det.get('tf_cuda')}, TF cuDNN={det.get('tf_cudnn')}"
+            )
+            notes = det.get("notes") or []
+            for n in notes:
+                lines.append(f"ℹ️ {n}")
+        text = "\n".join(lines) if lines else "Run checks to populate summary."
+        self._env_set_summary(text)
 
     # -------- Progress dialog helpers --------
     def _start_progress(self, title: str, maximum: int | None = None, style: str | None = None):
@@ -417,6 +1842,35 @@ class DataProcessorApp(tk.Tk):
         except Exception:
             pass
 
+    def _progress_set_indeterminate(self, on: bool, text: str | None = None):
+        """Temporarily toggle the progress bar to indeterminate (marquee) mode.
+
+        Useful while a single long-running step is executing so users can see activity.
+        When turned off, restores determinate mode using the existing value/maximum.
+        """
+        try:
+            bar = getattr(self, "_prog_bar", None)
+            lbl = getattr(self, "_prog_lbl", None)
+            if bar is None:
+                return
+            if on:
+                # Remember that we're in a temporary indeterminate state
+                # We do not alter the current determinate value; just switch modes.
+                bar.configure(mode="indeterminate")
+                if text and lbl is not None:
+                    lbl.configure(text=text)
+                bar.start(10)
+            else:
+                # Switch back to determinate; keep prior value/maximum as already set
+                try:
+                    bar.stop()
+                except Exception:
+                    pass
+                bar.configure(mode="determinate")
+            self.update_idletasks()
+        except Exception:
+            pass
+
     def _end_progress(self):
         try:
             if getattr(self, "_prog_win", None) is not None:
@@ -427,6 +1881,185 @@ class DataProcessorApp(tk.Tk):
             self._prog_win = None
             self._prog_bar = None
             self._prog_lbl = None
+
+    def _preprocess_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply missing-value handling, scaling, and encoding to a DataFrame.
+
+        Controlled by Tk variables:
+        - do_preprocess_var
+        - missing_strategy_var
+        - scaling_var
+        - encoding_var
+        - preproc_exclude_cols_var
+        Uses scikit-learn if available; falls back to pandas/numpy implementations.
+        """
+        try:
+            use_sklearn = True
+            from sklearn.preprocessing import StandardScaler, MinMaxScaler, OrdinalEncoder  # type: ignore
+        except Exception:
+            use_sklearn = False
+            StandardScaler = MinMaxScaler = OrdinalEncoder = None  # type: ignore
+
+        df_proc = df.copy()
+        # Determine excluded columns
+        excl_text = ""
+        try:
+            excl_text = (self.preproc_exclude_cols_var.get() or "").strip()
+        except Exception:
+            pass
+        excluded = {c.strip() for c in excl_text.split(',') if c.strip()}
+        # Identify column types
+        numeric_cols_auto = [c for c in df_proc.select_dtypes(include=[np.number]).columns if c not in excluded]
+        cat_cols_auto = [c for c in df_proc.columns if c not in excluded and c not in numeric_cols_auto]
+        # Optional include lists
+        def _parse_list(val: str) -> list[str]:
+            return [c.strip() for c in (val or "").split(',') if c.strip()]
+        include_num = _parse_list(getattr(self.preproc_include_num_cols_var, 'get', lambda: "")())
+        include_cat = _parse_list(getattr(self.preproc_include_cat_cols_var, 'get', lambda: "")())
+        numeric_cols = [c for c in (include_num or numeric_cols_auto) if c in df_proc.columns and c not in excluded and pd.api.types.is_numeric_dtype(df_proc[c])]
+        cat_cols = [c for c in (include_cat or cat_cols_auto) if c in df_proc.columns and c not in excluded and not pd.api.types.is_numeric_dtype(df_proc[c])]
+
+        # 1) Missing values
+        strat = (self.missing_strategy_var.get() if hasattr(self, 'missing_strategy_var') else 'None')
+        if strat and strat.lower() != "none":
+            self.log(f"Preprocess: missing strategy = {strat}")
+            if strat.lower() == "drop rows":
+                before = len(df_proc)
+                df_proc = df_proc.dropna().reset_index(drop=True)
+                self.log(f" - dropped {before - len(df_proc)} rows with any NaN")
+            elif strat.lower() == "fill numeric mean":
+                for c in numeric_cols:
+                    try:
+                        m = df_proc[c].astype(float).mean()
+                        df_proc[c] = df_proc[c].fillna(m)
+                    except Exception:
+                        pass
+            elif strat.lower() == "fill numeric median":
+                for c in numeric_cols:
+                    try:
+                        m = df_proc[c].astype(float).median()
+                        df_proc[c] = df_proc[c].fillna(m)
+                    except Exception:
+                        pass
+            elif strat.lower() == "fill num mean + cat mode":
+                for c in numeric_cols:
+                    try:
+                        m = df_proc[c].astype(float).mean()
+                        df_proc[c] = df_proc[c].fillna(m)
+                    except Exception:
+                        pass
+                for c in cat_cols:
+                    try:
+                        mode_val = df_proc[c].mode(dropna=True)
+                        if not mode_val.empty:
+                            df_proc[c] = df_proc[c].fillna(mode_val.iloc[0])
+                    except Exception:
+                        pass
+            elif strat.lower() == "fill num median + cat mode":
+                for c in numeric_cols:
+                    try:
+                        m = df_proc[c].astype(float).median()
+                        df_proc[c] = df_proc[c].fillna(m)
+                    except Exception:
+                        pass
+                for c in cat_cols:
+                    try:
+                        mode_val = df_proc[c].mode(dropna=True)
+                        if not mode_val.empty:
+                            df_proc[c] = df_proc[c].fillna(mode_val.iloc[0])
+                    except Exception:
+                        pass
+            elif strat.lower() == "fill with 0/''":
+                for c in numeric_cols:
+                    df_proc[c] = df_proc[c].fillna(0)
+                for c in cat_cols:
+                    df_proc[c] = df_proc[c].fillna("")
+            elif strat.lower() == "ffill":
+                df_proc = df_proc.ffill()
+            elif strat.lower() == "bfill":
+                df_proc = df_proc.bfill()
+
+        # 2) Encoding
+        enc = (self.encoding_var.get() if hasattr(self, 'encoding_var') else 'None')
+        if enc and enc.lower() != "none" and cat_cols:
+            self.log(f"Preprocess: encoding = {enc} on {len(cat_cols)} column(s)")
+            if enc.lower().startswith("one-hot"):
+                try:
+                    dummy_na = bool(getattr(self.onehot_include_nan_var, 'get', lambda: False)())
+                    df_proc = pd.get_dummies(df_proc, columns=cat_cols, dummy_na=dummy_na)
+                except Exception:
+                    # Best effort fallback: operate per column
+                    for c in cat_cols:
+                        try:
+                            dummy_na = bool(getattr(self.onehot_include_nan_var, 'get', lambda: False)())
+                            d = pd.get_dummies(df_proc[c], prefix=c, dummy_na=dummy_na)
+                            df_proc = pd.concat([df_proc.drop(columns=[c]), d], axis=1)
+                        except Exception:
+                            pass
+                # After get_dummies, categorical columns updated; reset lists
+                numeric_cols = [c for c in df_proc.select_dtypes(include=[np.number]).columns if c not in excluded]
+            else:  # Label/Ordinal
+                if use_sklearn and OrdinalEncoder is not None:
+                    try:
+                        enc_obj = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                        df_proc[cat_cols] = enc_obj.fit_transform(df_proc[cat_cols].astype(str))
+                    except Exception:
+                        # fallback per-column
+                        for c in cat_cols:
+                            codes, _ = pd.factorize(df_proc[c].astype(str), sort=True)
+                            df_proc[c] = codes
+                else:
+                    for c in cat_cols:
+                        try:
+                            codes, _ = pd.factorize(df_proc[c].astype(str), sort=True)
+                            df_proc[c] = codes
+                        except Exception:
+                            pass
+                # Encoded categories are now numeric
+                numeric_cols = [c for c in df_proc.select_dtypes(include=[np.number]).columns if c not in excluded]
+
+        # 3) Scaling
+        scale = (self.scaling_var.get() if hasattr(self, 'scaling_var') else 'None')
+        if scale and scale.lower() != "none" and numeric_cols:
+            self.log(f"Preprocess: scaling = {scale} on {len(numeric_cols)} numeric column(s)")
+            X = df_proc[numeric_cols].astype(float)
+            if scale.lower().startswith("standardize"):
+                if use_sklearn and StandardScaler is not None:
+                    try:
+                        scaler = StandardScaler()
+                        df_proc[numeric_cols] = scaler.fit_transform(X)
+                    except Exception:
+                        # manual
+                        mu = X.mean(axis=0)
+                        sd = X.std(axis=0).replace(0, 1.0)
+                        df_proc[numeric_cols] = (X - mu) / sd
+                else:
+                    mu = X.mean(axis=0)
+                    sd = X.std(axis=0).replace(0, 1.0)
+                    df_proc[numeric_cols] = (X - mu) / sd
+            else:  # Min-Max [0,1]
+                if use_sklearn and MinMaxScaler is not None:
+                    try:
+                        scaler = MinMaxScaler()
+                        df_proc[numeric_cols] = scaler.fit_transform(X)
+                    except Exception:
+                        mn = X.min(axis=0)
+                        mx = X.max(axis=0)
+                        rng = (mx - mn).replace(0, 1.0)
+                        df_proc[numeric_cols] = (X - mn) / rng
+                else:
+                    mn = X.min(axis=0)
+                    mx = X.max(axis=0)
+                    rng = (mx - mn).replace(0, 1.0)
+                    df_proc[numeric_cols] = (X - mn) / rng
+
+        # Optional: drop rows with non-finite after scaling/encoding
+        if bool(getattr(self.drop_nonfinite_after_scale_var, 'get', lambda: False)()):
+            before = len(df_proc)
+            df_proc = df_proc.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
+            self.log(f"Preprocess: dropped {before - len(df_proc)} rows with non-finite/NaN after transforms")
+
+        return df_proc
 
     # Core processing
     def process(self):
@@ -465,6 +2098,16 @@ class DataProcessorApp(tk.Tk):
                     return
                 df = df[keep_cols]
                 self.log(f"Keeping columns: {keep_cols}")
+
+            # Preprocessing (optional)
+            try:
+                if bool(self.do_preprocess_var.get()):
+                    self.log("Applying preprocessing...")
+                    df = self._preprocess_dataframe(df)
+                    self.log("Preprocessing complete.")
+            except Exception as e:
+                messagebox.showerror("Preprocess", f"Preprocessing failed: {e}")
+                return
 
             # If user selected a detection export format but we're missing required columns and not in Neural mode,
             # offer to switch to Neural to auto-label.
@@ -706,30 +2349,111 @@ class DataProcessorApp(tk.Tk):
 
         def worker():
             done = 0
+            # Snapshot versions before any installs
+            prev_versions = self._collect_versions()
             python_exe = sys.executable
+            # Detect availability of backends to avoid noisy failures
+            try:
+                import torchvision as _tv  # type: ignore
+                tv_available = True
+            except Exception:
+                tv_available = False
+                self.after(0, lambda: self.log("TorchVision not installed; attempting automatic install (CPU wheels)..."))
+                # Attempt auto-install of Torch/TorchVision CPU build
+                tv_install_cmd = [
+                    python_exe, "-m", "pip", "install",
+                    "torch", "torchvision", "torchaudio",
+                    "--index-url", "https://download.pytorch.org/whl/cpu",
+                ]
+                self._run_ps_step(tv_install_cmd, "Install Torch/TorchVision (CPU)")
+                # Re-check
+                try:
+                    import torchvision as _tv2  # type: ignore
+                    tv_available = True
+                    self.after(0, lambda: self.log("TorchVision installation succeeded."))
+                except Exception as e:
+                    tv_available = False
+                    self.after(0, lambda: self.log(f"TorchVision installation failed: {e}"))
+            try:
+                import ultralytics as _ul  # type: ignore
+                yolo_available = True
+            except Exception:
+                yolo_available = False
+                self.after(0, lambda: self.log("Ultralytics not installed; attempting automatic install..."))
+                # Try to avoid downgrading core deps like numpy during install
+                cur_numpy = self._pkg_version("numpy")
+                ul_install_cmd = [
+                    python_exe, "-m", "pip", "install",
+                    "--upgrade-strategy", "only-if-needed",
+                    "ultralytics",
+                ]
+                if cur_numpy:
+                    ul_install_cmd += [f"numpy=={cur_numpy}"]
+                self._run_ps_step(ul_install_cmd, "Install Ultralytics")
+                # Re-check
+                try:
+                    import ultralytics as _ul2  # type: ignore
+                    yolo_available = True
+                    self.after(0, lambda: self.log("Ultralytics installation succeeded."))
+                except Exception as e:
+                    yolo_available = False
+                    self.after(0, lambda: self.log(f"Ultralytics installation failed: {e}"))
+
+            # Compute total steps based on available backends
+            try:
+                total = (len(models_tv) if tv_available else 0) + (len(models_yolo) if yolo_available else 0)
+            except Exception:
+                total = 0
+            if total == 0:
+                self.after(0, lambda: self.log("No backends available for download after installation attempts."))
+            # Detect if any core package versions changed during installs
+            new_versions = self._collect_versions()
+            changed = []
+            try:
+                for k, v in prev_versions.items():
+                    if new_versions.get(k) != v:
+                        changed.append((k, v, new_versions.get(k)))
+            except Exception:
+                pass
             # TorchVision
-            for arch in models_tv:
-                cmd = [
-                    "powershell", "-NoProfile", "-Command",
-                    f"& '{python_exe}' -c \"import torchvision as tv; tv.models.get_model('{arch}', weights='DEFAULT')\""
-                ]
-                self._run_ps_step(cmd, f"TorchVision: {arch}")
-                done += 1
-                self.after(0, lambda d=done: self._update_progress(d, f"{d}/{total} ({int(d/total*100)}%)"))
+            if tv_available:
+                for arch in models_tv:
+                    cmd = [
+                        python_exe, "-c",
+                        f"import torchvision as tv; tv.models.get_model('{arch}', weights='DEFAULT')"
+                    ]
+                    self._run_ps_step(cmd, f"TorchVision: {arch}")
+                    done += 1
+                    if total:
+                        self.after(0, lambda d=done: self._update_progress(d, f"{d}/{total} ({int(d/total*100)}%)"))
             # Ultralytics
-            for name in models_yolo:
-                cmd = [
-                    "powershell", "-NoProfile", "-Command",
-                    f"& '{python_exe}' -c \"from ultralytics import YOLO; YOLO('{name}')\""
-                ]
-                self._run_ps_step(cmd, f"Ultralytics: {name}")
-                done += 1
-                self.after(0, lambda d=done: self._update_progress(d, f"{d}/{total} ({int(d/total*100)}%)"))
+            if yolo_available:
+                for name in models_yolo:
+                    cmd = [
+                        python_exe, "-c",
+                        f"from ultralytics import YOLO; YOLO('{name}')"
+                    ]
+                    self._run_ps_step(cmd, f"Ultralytics: {name}")
+                    done += 1
+                    if total:
+                        self.after(0, lambda d=done: self._update_progress(d, f"{d}/{total} ({int(d/total*100)}%)"))
             self.after(0, self._end_progress)
             try:
                 self.after(0, lambda: messagebox.showinfo("Download", "Model downloads completed."))
             except Exception:
                 pass
+            # If core libs changed, recommend restart to avoid in-process ABI/version mismatches
+            if changed:
+                msg_lines = ["Some core libraries changed during installation:"]
+                for k, old, new in changed:
+                    msg_lines.append(f" - {k}: {old or 'not installed'} -> {new or 'not installed'}")
+                msg_lines.append("")
+                msg_lines.append("It's recommended to restart the application to ensure a clean state.")
+                try:
+                    self.after(0, lambda: messagebox.showwarning("Restart Recommended", "\n".join(msg_lines)))
+                except Exception:
+                    # Fallback to log only
+                    self.after(0, lambda: self.log("Restart Recommended due to library changes:\n" + "\n".join(msg_lines)))
             # Re-enable button and clear flag
             def _finish_reset():
                 try:
@@ -745,30 +2469,66 @@ class DataProcessorApp(tk.Tk):
 
     def _run_ps_step(self, cmd: list[str], label: str):
         try:
-            self.after(0, lambda: self.log(f"Running PowerShell: {label}"))
-            import subprocess
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                self.after(0, lambda s=line.strip(): self.log(s))
-            proc.wait()
-            if proc.returncode != 0:
-                self.after(0, lambda: self.log(f"Failed: {label} (exit {proc.returncode})"))
+            self.after(0, lambda: self.log(f"Running command: {label}"))
+            # While this step runs, show indeterminate animation so UI looks active
+            self.after(0, lambda: self._progress_set_indeterminate(True, f"{label} (working...)"))
+            import subprocess, threading, os as _os
+            # Environment tweaks to improve streaming and avoid interactive prompts
+            _env = _os.environ.copy()
+            _env.setdefault("PYTHONUNBUFFERED", "1")
+            _env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+            _env.setdefault("PIP_NO_COLOR", "1")
+            # Start process with text output, closed stdin to avoid waiting for input
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                env=_env,
+            )
+
+            # Reader thread to stream output without blocking main thread
+            def _reader():
+                try:
+                    if proc.stdout is not None:
+                        for line in iter(proc.stdout.readline, ''):
+                            if not line:
+                                break
+                            self.after(0, lambda s=line.rstrip(): self.log(s))
+                except Exception as re:
+                    self.after(0, lambda: self.log(f"[reader] {label}: {re}"))
+
+            t = threading.Thread(target=_reader, daemon=True)
+            t.start()
+
+            # Enforce a per-step timeout to avoid indefinite hangs
+            STEP_TIMEOUT_S = 1800  # 30 minutes per step max
+            try:
+                proc.wait(timeout=STEP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                self.after(0, lambda: self.log(f"Timeout after {STEP_TIMEOUT_S}s: {label}. Terminating process..."))
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=15)
+                except Exception:
+                    pass
+
+            rc = proc.returncode if proc.returncode is not None else -1
+            if rc != 0:
+                self.after(0, lambda: self.log(f"Failed: {label} (exit {rc})"))
             else:
                 self.after(0, lambda: self.log(f"Done: {label}"))
         except Exception as e:
             self.after(0, lambda: self.log(f"Error running PowerShell for {label}: {e}"))
-        df = df.copy()
-        if "label" not in df.columns:
-            df["label"] = np.nan
-        for i, row in df.iterrows():
-            p = str(row.get("image_path"))
-            if p in pred_map:
-                if overwrite or pd.isna(row.get("label")) or row.get("label") in (None, ""):
-                    df.at[i, "label"] = pred_map[p]
-        return df
+        finally:
+            # Restore determinate mode so step counting continues
+            self.after(0, lambda: self._progress_set_indeterminate(False))
+        # Note: this helper only logs subprocess output; it doesn't modify DataFrames.
 
     def _neural_detection(self, df: pd.DataFrame, model_path: str, conf: float, overwrite: bool) -> pd.DataFrame:
         if "image_path" not in df.columns:
@@ -1488,6 +3248,8 @@ class DataProcessorApp(tk.Tk):
         flat = arr.reshape(arr.shape[0], -1)
         out_df = pd.DataFrame(flat, columns=cols)
         path = os.path.join(out_dir, f"{base}_ts_windows.parquet")
+        if pyarrow is None:
+            raise RuntimeError("pyarrow is required for Parquet. Please install it (pip install pyarrow).")
         out_df.to_parquet(path, index=False)
         return path
 
@@ -1563,8 +3325,18 @@ class DataProcessorApp(tk.Tk):
         top = tk.Toplevel(self)
         top.title("Preview (first 50 rows)")
         top.geometry("800x400")
-        txt = tk.Text(top, wrap=tk.NONE)
-        txt.pack(fill=tk.BOTH, expand=True)
+        # Add scrollable text area for better UX
+        xscroll = tk.Scrollbar(top, orient=tk.HORIZONTAL)
+        yscroll = tk.Scrollbar(top, orient=tk.VERTICAL)
+        txt = tk.Text(top, wrap=tk.NONE, xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+        yscroll.config(command=txt.yview)
+        xscroll.config(command=txt.xview)
+        # Layout
+        txt.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        top.grid_columnconfigure(0, weight=1)
+        top.grid_rowconfigure(0, weight=1)
         txt.insert(tk.END, df.to_string(max_rows=50, max_cols=30))
         txt.configure(state=tk.DISABLED)
 
@@ -1575,50 +3347,86 @@ class DataProcessorApp(tk.Tk):
         """
         rng = np.random.default_rng(random_state)
 
-        def split_indices(n):
-            n_train = int(round(n * tr))
-            n_val = int(round(n * vr))
-            # ensure we don't exceed n due to rounding
-            n_train = min(n_train, n)
-            n_val = min(n_val, max(0, n - n_train))
-            n_test = max(0, n - n_train - n_val)
-            return n_train, n_val, n_test
+        # Try to use scikit-learn if available for robust splitting
+        try:
+            from sklearn.model_selection import StratifiedShuffleSplit, train_test_split  # type: ignore
+            use_sklearn = True
+        except Exception:
+            use_sklearn = False
 
-        if strat_col is None:
-            idx = np.arange(len(df))
-            rng.shuffle(idx)
-            n_train, n_val, n_test = split_indices(len(idx))
-            train_idx = idx[:n_train]
-            val_idx = idx[n_train:n_train + n_val]
-            test_idx = idx[n_train + n_val: n_train + n_val + n_test]
-            return df.iloc[train_idx].reset_index(drop=True), df.iloc[val_idx].reset_index(drop=True), df.iloc[test_idx].reset_index(drop=True)
+        if not strat_col:
+            # No stratification
+            if use_sklearn:
+                # Do two-step split to get train, then split remaining into val/test with proper ratios
+                df_temp, df_test = train_test_split(df, test_size=te, random_state=random_state)
+                remaining = 1.0 - te
+                val_ratio_in_remaining = vr / max(remaining, 1e-9)
+                df_train, df_val = train_test_split(df_temp, test_size=val_ratio_in_remaining, random_state=random_state)
+                return df_train.reset_index(drop=True), df_val.reset_index(drop=True), df_test.reset_index(drop=True)
+            else:
+                # Fallback to numpy-based split
+                n = len(df)
+                idx = np.arange(n)
+                rng.shuffle(idx)
+                n_train = int(round(n * tr))
+                n_val = int(round(n * vr))
+                n_train = min(n_train, n)
+                n_val = min(n_val, max(0, n - n_train))
+                tr_i = idx[:n_train]
+                va_i = idx[n_train:n_train+n_val]
+                te_i = idx[n_train+n_val:]
+                return df.iloc[tr_i].reset_index(drop=True), df.iloc[va_i].reset_index(drop=True), df.iloc[te_i].reset_index(drop=True)
 
-        # Stratified: process each class separately
+        # With stratification
         if strat_col not in df.columns:
-            raise ValueError(f"Stratify column '{strat_col}' not found")
-
-        parts_train = []
-        parts_val = []
-        parts_test = []
-        for cls, group in df.groupby(strat_col, sort=False):
-            n = len(group)
-            if n == 0:
-                continue
-            # If class is too small and any split ratio > 0, still attempt best-effort split
-            local_idx = np.arange(n)
-            rng.shuffle(local_idx)
-            n_train, n_val, n_test = split_indices(n)
-            tr_i = local_idx[:n_train]
-            va_i = local_idx[n_train:n_train + n_val]
-            te_i = local_idx[n_train + n_val:n_train + n_val + n_test]
-            parts_train.append(group.iloc[tr_i])
-            parts_val.append(group.iloc[va_i])
-            parts_test.append(group.iloc[te_i])
-
-        df_train = pd.concat(parts_train, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True) if parts_train else df.iloc[0:0]
-        df_val = pd.concat(parts_val, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True) if parts_val else df.iloc[0:0]
-        df_test = pd.concat(parts_test, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True) if parts_test else df.iloc[0:0]
-        return df_train, df_val, df_test
+            raise ValueError(f"Stratify column '{strat_col}' not found in DataFrame")
+        y = df[strat_col]
+        if use_sklearn:
+            # First split off test with stratification
+            sss1 = StratifiedShuffleSplit(n_splits=1, test_size=te, random_state=random_state)
+            idx_all = np.arange(len(df))
+            for train_val_idx, test_idx in sss1.split(idx_all, y):
+                df_train_val = df.iloc[train_val_idx]
+                df_test = df.iloc[test_idx]
+            # Now split train_val into train and val with stratification and adjusted ratio
+            remaining = 1.0 - te
+            val_ratio_in_remaining = vr / max(remaining, 1e-9)
+            sss2 = StratifiedShuffleSplit(n_splits=1, test_size=val_ratio_in_remaining, random_state=random_state)
+            y_tv = df_train_val[strat_col]
+            idx_tv = np.arange(len(df_train_val))
+            for train_idx, val_idx in sss2.split(idx_tv, y_tv):
+                df_train = df_train_val.iloc[train_idx]
+                df_val = df_train_val.iloc[val_idx]
+            return (
+                df_train.reset_index(drop=True),
+                df_val.reset_index(drop=True),
+                df_test.reset_index(drop=True),
+            )
+        else:
+            # Fallback: per-class shuffle and slice
+            parts_train = []
+            parts_val = []
+            parts_test = []
+            for cls, group in df.groupby(strat_col, sort=False):
+                n = len(group)
+                if n == 0:
+                    continue
+                idx = np.arange(n)
+                rng.shuffle(idx)
+                n_train = int(round(n * tr))
+                n_val = int(round(n * vr))
+                n_train = min(n_train, n)
+                n_val = min(n_val, max(0, n - n_train))
+                tr_i = idx[:n_train]
+                va_i = idx[n_train:n_train+n_val]
+                te_i = idx[n_train+n_val:]
+                parts_train.append(group.iloc[tr_i])
+                parts_val.append(group.iloc[va_i])
+                parts_test.append(group.iloc[te_i])
+            df_train = pd.concat(parts_train, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True) if parts_train else df.iloc[0:0]
+            df_val = pd.concat(parts_val, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True) if parts_val else df.iloc[0:0]
+            df_test = pd.concat(parts_test, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True) if parts_test else df.iloc[0:0]
+            return df_train, df_val, df_test
 
 
 def main():
@@ -1629,7 +3437,12 @@ def main():
         if sys.platform == 'win32':
             style.theme_use('vista')
         else:
-            style.theme_use(style.theme_use())
+            # Prefer a modern cross-platform theme if available
+            if 'clam' in style.theme_names():
+                style.theme_use('clam')
+            else:
+                # leave default theme
+                pass
     except Exception:
         pass
     app.mainloop()
