@@ -24,7 +24,10 @@ if ($Clean) {
 # Install runtime dependencies (single consolidated file)
 Write-Host "Installing project dependencies..." -ForegroundColor Cyan
 & $py -m pip install --upgrade pip
-if (Test-Path "requirements.txt") { & $py -m pip install -r requirements.txt }
+$reqFile = $null
+if (Test-Path "requirements.txt") { $reqFile = "requirements.txt" }
+elseif (Test-Path "requirments.txt") { $reqFile = "requirments.txt" }
+if ($reqFile) { & $py -m pip install -r $reqFile }
 
 # Ensure PyInstaller
 Write-Host "Installing build dependency: pyinstaller" -ForegroundColor Cyan
@@ -40,14 +43,17 @@ foreach ($f in $ptFiles) {
     $addDataArgs += @('--add-data', "$($f.Name);.")
 }
 
-& $py -m PyInstaller `
-    --name "DatasetConverter" `
-    --noconfirm `
-    --windowed `
-    --clean `
-    --paths "." `
-    --add-data "requirements.txt;." `
-    $addDataArgs `
-    app.py
+$piArgs = @(
+    '-m', 'PyInstaller',
+    '--name', 'DatasetConverter',
+    '--noconfirm',
+    '--windowed',
+    '--clean',
+    '--paths', '.'
+)
+if ($reqFile) { $piArgs += @('--add-data', "$reqFile;.") }
+$piArgs += $addDataArgs
+$piArgs += 'app.py'
+& $py @piArgs
 
 Write-Host "Build complete. EXE at: dist/DatasetConverter/DatasetConverter.exe" -ForegroundColor Green
